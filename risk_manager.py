@@ -9,9 +9,19 @@ from config import RISK_PER_TRADE, MIN_RR_RATIO, CAPITAL_PER_TRADE
 # ─── Constants ─────────────────────────────────────────────────
 TRADING_FEE_PCT = 0.0004        # 0.04% per side (maker), 0.04% round trip = 0.08%
 ROUND_TRIP_FEE_PCT = 0.0008     # Total fees for entry + exit
-MAX_LEVERAGE = 20               # Hard cap — never exceed 20x regardless of confidence
+SLIPPAGE_PCT = 0.0010           # 0.10% estimated slippage (entry + exit combined)
+TOTAL_COST_PCT = ROUND_TRIP_FEE_PCT + SLIPPAGE_PCT  # ~0.18% total friction
+MAX_LEVERAGE = 12               # Hard cap — conservative until strategy is proven profitable
 MAX_CONCURRENT_RISK_PCT = 0.06  # Max 6% of account at risk across all positions
 MAX_HOLD_HOURS = 4              # Max hold time for scalp trades (hours)
+MAX_DAILY_LOSS_PCT = 0.05       # 5% max daily drawdown — stop trading for the day
+
+# Minimum R:R (after fees+slippage) by trade type — scalps have tighter targets
+MIN_RR_BY_TYPE = {
+    "SCALP": 1.2,
+    "INTRADAY": MIN_RR_RATIO,
+    "SWING": MIN_RR_RATIO,
+}
 
 
 def calculate_position_size(account_balance: float, entry_price: float,
@@ -52,8 +62,8 @@ def calculate_position_size(account_balance: float, entry_price: float,
     # Actual dollar at risk = stop_distance * quantity
     actual_risk = stop_distance * quantity
 
-    # Add fee cost to risk (entry + exit fees)
-    fee_cost = position_size * ROUND_TRIP_FEE_PCT
+    # Add fee + slippage cost to risk
+    fee_cost = position_size * TOTAL_COST_PCT
     total_risk = actual_risk + fee_cost
 
     if total_risk > risk_amount * 1.05:  # 5% tolerance
@@ -62,7 +72,7 @@ def calculate_position_size(account_balance: float, entry_price: float,
         position_size *= scale
         quantity = position_size / entry_price
         actual_risk = stop_distance * quantity
-        fee_cost = position_size * ROUND_TRIP_FEE_PCT
+        fee_cost = position_size * TOTAL_COST_PCT
         total_risk = actual_risk + fee_cost
 
     margin_used = position_size / leverage
@@ -103,32 +113,33 @@ def calculate_take_profit(entry_price: float, stop_loss: float,
 
 
 def calculate_breakeven(entry_price: float, direction: str) -> float:
-    """Calculate breakeven including Binance round-trip fees."""
+    """Calculate breakeven including fees + slippage."""
     if direction == "LONG":
-        return entry_price * (1 + ROUND_TRIP_FEE_PCT)
+        return entry_price * (1 + TOTAL_COST_PCT)
     else:
-        return entry_price * (1 - ROUND_TRIP_FEE_PCT)
+        return entry_price * (1 - TOTAL_COST_PCT)
 
 
 def get_leverage_for_confidence(confidence: int) -> int:
     """
-    Map confidence score to leverage. CAPPED at 20x for safety.
-    1-5:  Don't trade (0)
-    6:    5x  (conservative)
-    7:    10x
-    8:    15x
-    9-10: 20x (hard cap)
+    Map confidence score to leverage. CAPPED at 12x until strategy is proven.
+
+    1-6:  Don't trade (0) — raised minimum to 7
+    7:    5x  (conservative entry)
+    8:    8x  (moderate)
+    9:    10x
+    10:   12x (hard cap)
     """
-    if confidence <= 5:
+    if confidence <= 6:
         return 0
-    elif confidence == 6:
-        return 5
     elif confidence == 7:
-        return 10
+        return 5
     elif confidence == 8:
-        return 15
-    else:  # 9-10
-        return min(20, MAX_LEVERAGE)
+        return 8
+    elif confidence == 9:
+        return 10
+    else:  # 10
+        return min(12, MAX_LEVERAGE)
 
 
 def calculate_expected_pnl(entry_price: float, stop_loss: float,
@@ -145,7 +156,7 @@ def calculate_expected_pnl(entry_price: float, stop_loss: float,
     # Deduct fees from profit, add to loss
     if position_size is None:
         position_size = entry_price * quantity
-    fee = position_size * ROUND_TRIP_FEE_PCT
+    fee = position_size * TOTAL_COST_PCT  # includes slippage
 
     net_profit = gross_profit - fee
     net_loss = gross_loss + fee
@@ -162,8 +173,10 @@ def calculate_expected_pnl(entry_price: float, stop_loss: float,
 
 def validate_trade(account_balance: float, entry_price: float,
                    stop_loss: float, take_profit: float,
-                   confidence: int, direction: str) -> dict:
+                   confidence: int, direction: str,
+                   trade_type: str = "SCALP") -> dict:
     """Full trade validation with leverage-aware risk and fee calculation."""
+    min_rr = MIN_RR_BY_TYPE.get(trade_type, MIN_RR_RATIO)
     # Check confidence
     leverage = get_leverage_for_confidence(confidence)
     if leverage == 0:
@@ -172,20 +185,21 @@ def validate_trade(account_balance: float, entry_price: float,
             "reason": f"DON'T TRADE — Confidence {confidence}/10 is below threshold (min 6)",
         }
 
-    # Check R:R (account for fees)
+    # Check basic R:R (raw, pre-fees)
     stop_dist = abs(entry_price - stop_loss)
     tp_dist = abs(take_profit - entry_price)
     if stop_dist == 0:
         return {"approved": False, "reason": "Stop distance is zero"}
 
-    rr = tp_dist / stop_dist
-    if rr < MIN_RR_RATIO - 0.01:
-        return {"approved": False, "reason": f"R:R {rr:.2f} below minimum {MIN_RR_RATIO}"}
+    rr_raw = tp_dist / stop_dist
+    if rr_raw < 1.5:
+        return {"approved": False, "reason": f"Raw R:R {rr_raw:.2f} is too low (need 1.5+ raw)"}
 
-    # Check stop is not too tight (minimum 0.3% from entry)
+    # Check stop is not too tight — friction (0.18%) must be < 60% of SL distance
     stop_pct = (stop_dist / entry_price) * 100
-    if stop_pct < 0.15:
-        return {"approved": False, "reason": f"Stop too tight ({stop_pct:.2f}%) — will get wicked out. Min 0.15%"}
+    min_stop_pct = 0.30  # 0.30% min — ensures friction doesn't dominate on 5m scalps
+    if stop_pct < min_stop_pct:
+        return {"approved": False, "reason": f"Stop too tight ({stop_pct:.2f}%) — min {min_stop_pct:.2f}% for scalps"}
 
     # Calculate position
     pos = calculate_position_size(account_balance, entry_price, stop_loss, leverage)
@@ -196,9 +210,17 @@ def validate_trade(account_balance: float, entry_price: float,
     pnl = calculate_expected_pnl(entry_price, stop_loss, take_profit,
                                  pos["quantity"], direction, pos["position_size"])
 
+    # Reject if after-fees R:R is below minimum (lower bar for SCALP — tighter targets)
+    if pnl["rr_ratio"] < min_rr:
+        return {
+            "approved": False,
+            "reason": f"R:R after fees+slippage is {pnl['rr_ratio']:.2f}:1 — need {min_rr}:1+ for {trade_type}. "
+                      f"Raw R:R {rr_raw:.2f}:1 but friction eats too much on this setup."
+        }
+
     # Reject if fees eat too much of the profit
     if pnl["fees"] > pnl["expected_profit"] * 0.3:
-        return {"approved": False, "reason": f"Fees (${pnl['fees']:.2f}) eat >30% of profit — target too small"}
+        return {"approved": False, "reason": f"Fees+slippage (${pnl['fees']:.2f}) eat >30% of profit — target too small"}
 
     breakeven = calculate_breakeven(entry_price, direction)
 

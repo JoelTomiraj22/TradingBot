@@ -25,7 +25,7 @@ DEFAULT_PAIR = "BTC/USDT"
 DEFAULT_TIMEFRAME = "5m"
 DEFAULT_LEVERAGE = 10
 RISK_PER_TRADE = 0.02          # 2% of account balance
-MIN_RR_RATIO = 2.0             # Minimum reward:risk ratio
+MIN_RR_RATIO = 2.2             # Minimum reward:risk ratio (after fees + slippage)
 CAPITAL_PER_TRADE = 10.0       # $8–$10 per trade
 SCAN_INTERVAL_MINUTES = 15     # Scanner runs every 15 min
 

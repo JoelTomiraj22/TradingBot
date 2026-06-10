@@ -4,7 +4,7 @@ Market/limit orders, SL/TP, position management.
 """
 
 import math
-from config import get_exchange
+from config import get_exchange, USE_TESTNET
 
 
 class OrderExecutor:
@@ -125,6 +125,15 @@ class OrderExecutor:
                 side=side,
                 amount=quantity,
             )
+            # Market order responses often come back with average/cost = 0
+            # before the fill propagates — re-fetch to get real fill data.
+            if not order.get("average") and not order.get("price"):
+                try:
+                    filled = self.exchange.fetch_order(order["id"], symbol)
+                    if filled.get("average") or filled.get("price"):
+                        order = filled
+                except Exception:
+                    pass
             print(f"[Order] Market {side.upper()} {quantity} {symbol} — ID: {order['id']}")
             return order
         except Exception as e:
@@ -153,6 +162,53 @@ class OrderExecutor:
             print(f"[Order] Limit order error: {e}")
             return {"error": str(e)}
 
+    def _market_id(self, symbol: str) -> str:
+        """Return the raw exchange symbol ID (e.g. 'LTCUSDT' from 'LTC/USDT')."""
+        try:
+            return self.exchange.market(symbol)["id"]
+        except Exception:
+            return symbol.replace("/", "").replace(":USDT", "")
+
+    def _place_algo_stop(self, symbol: str, side: str, quantity: float,
+                         stop_price: float) -> dict:
+        """
+        Call Binance USDM algo endpoint directly: POST /fapi/v1/order/algo/stop
+        Required for Demo and some live accounts that reject STOP_MARKET on the
+        regular endpoint with error -4120.
+        """
+        market_id = self._market_id(symbol)
+        params = {
+            "symbol": market_id,
+            "side": side.upper(),
+            "quantity": str(quantity),
+            "stopPrice": str(stop_price),
+            "workingType": "CONTRACT_PRICE",
+            "timeInForce": "GTE_GTC",
+        }
+        # Not an implicit ccxt method in this version — call the raw endpoint.
+        response = self.exchange.request("order/algo/stop", "fapiPrivate", "POST", params)
+        # Algo response uses strategyId — normalise to id so callers don't break
+        if "strategyId" in response and "id" not in response:
+            response["id"] = response["strategyId"]
+        return response
+
+    def _place_algo_tp(self, symbol: str, side: str, quantity: float,
+                       stop_price: float) -> dict:
+        """Call Binance USDM algo endpoint: POST /fapi/v1/order/algo/takeProfit."""
+        market_id = self._market_id(symbol)
+        params = {
+            "symbol": market_id,
+            "side": side.upper(),
+            "quantity": str(quantity),
+            "stopPrice": str(stop_price),
+            "workingType": "CONTRACT_PRICE",
+            "timeInForce": "GTE_GTC",
+        }
+        response = self.exchange.request("order/algo/takeProfit", "fapiPrivate", "POST", params)
+        if "strategyId" in response and "id" not in response:
+            response["id"] = response["strategyId"]
+        return response
+
     def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float) -> dict:
         """
         Place a stop loss order.
@@ -161,32 +217,37 @@ class OrderExecutor:
         quantity = self._round_quantity(symbol, quantity)
         stop_price = self._round_price(symbol, stop_price)
 
-        # Try different order types in order of preference
-        attempts = [
-            ("stop_market", None, {"stopPrice": stop_price, "reduceOnly": True}),
-            ("STOP", stop_price, {"stopPrice": stop_price, "reduceOnly": True}),
-            ("stop", stop_price, {"stopPrice": stop_price, "reduceOnly": True}),
-        ]
+        # Binance Demo (demo-fapi.binance.com) rejects ALL conditional order
+        # types (-4120) and doesn't expose the algo endpoints (404) — go
+        # straight to software monitoring instead of wasting round-trips.
+        if USE_TESTNET:
+            return {"error": "Demo mode: exchange-side stop orders not supported", "skipped": True}
 
         last_error = None
-        for order_type, price, params in attempts:
+
+        # Try 1: Binance algo endpoint (required on some live accounts)
+        try:
+            order = self._place_algo_stop(symbol, side, quantity, stop_price)
+            print(f"[Order] Stop Loss (algo) {side.upper()} {quantity} {symbol} @ {stop_price} — ID: {order.get('id', '?')}")
+            return order
+        except Exception as e:
+            last_error = str(e)
+
+        # Try 2: Regular STOP_MARKET variants
+        for order_type, params in [
+            ("STOP_MARKET", {"stopPrice": stop_price, "reduceOnly": True, "workingType": "MARK_PRICE"}),
+            ("STOP_MARKET", {"stopPrice": stop_price, "reduceOnly": True}),
+            ("STOP_MARKET", {"stopPrice": stop_price, "closePosition": True}),
+        ]:
             try:
                 order = self.exchange.create_order(
-                    symbol=symbol,
-                    type=order_type,
-                    side=side,
-                    amount=quantity,
-                    price=price,
-                    params=params,
+                    symbol=symbol, type=order_type, side=side,
+                    amount=quantity, price=None, params=params,
                 )
                 print(f"[Order] Stop Loss {side.upper()} {quantity} {symbol} @ {stop_price} — ID: {order['id']}")
                 return order
             except Exception as e:
                 last_error = str(e)
-                if "-4120" in last_error or "requires a price" in last_error:
-                    continue
-                print(f"[Order] Stop loss error: {e}")
-                return {"error": last_error}
 
         print(f"[Order] Stop loss error: {last_error}")
         return {"error": last_error or "Stop loss order type not supported"}
@@ -199,34 +260,63 @@ class OrderExecutor:
         quantity = self._round_quantity(symbol, quantity)
         stop_price = self._round_price(symbol, stop_price)
 
-        attempts = [
-            ("take_profit_market", None, {"stopPrice": stop_price, "reduceOnly": True}),
-            ("TAKE_PROFIT", stop_price, {"stopPrice": stop_price, "reduceOnly": True}),
-            ("take_profit", stop_price, {"stopPrice": stop_price, "reduceOnly": True}),
-        ]
+        # Binance Demo (demo-fapi.binance.com) rejects ALL conditional order
+        # types (-4120) and doesn't expose the algo endpoints (404) — go
+        # straight to software monitoring instead of wasting round-trips.
+        if USE_TESTNET:
+            return {"error": "Demo mode: exchange-side take-profit orders not supported", "skipped": True}
 
         last_error = None
-        for order_type, price, params in attempts:
+
+        # Try 1: Binance algo endpoint
+        try:
+            order = self._place_algo_tp(symbol, side, quantity, stop_price)
+            print(f"[Order] Take Profit (algo) {side.upper()} {quantity} {symbol} @ {stop_price} — ID: {order.get('id', '?')}")
+            return order
+        except Exception as e:
+            last_error = str(e)
+
+        # Try 2: Regular TAKE_PROFIT_MARKET variants
+        for order_type, params in [
+            ("TAKE_PROFIT_MARKET", {"stopPrice": stop_price, "reduceOnly": True, "workingType": "MARK_PRICE"}),
+            ("TAKE_PROFIT_MARKET", {"stopPrice": stop_price, "reduceOnly": True}),
+            ("TAKE_PROFIT_MARKET", {"stopPrice": stop_price, "closePosition": True}),
+        ]:
             try:
                 order = self.exchange.create_order(
-                    symbol=symbol,
-                    type=order_type,
-                    side=side,
-                    amount=quantity,
-                    price=price,
-                    params=params,
+                    symbol=symbol, type=order_type, side=side,
+                    amount=quantity, price=None, params=params,
                 )
                 print(f"[Order] Take Profit {side.upper()} {quantity} {symbol} @ {stop_price} — ID: {order['id']}")
                 return order
             except Exception as e:
                 last_error = str(e)
-                if "-4120" in last_error or "requires a price" in last_error:
-                    continue
-                print(f"[Order] Take profit error: {e}")
-                return {"error": last_error}
 
         print(f"[Order] Take profit error: {last_error}")
         return {"error": last_error or "Take profit order type not supported"}
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel a specific order by ID."""
+        try:
+            self.exchange.cancel_order(order_id, symbol)
+            return True
+        except Exception as e:
+            print(f"[Order] Cancel error for {order_id}: {e}")
+            return False
+
+    def update_stop_loss(self, symbol: str, side: str, quantity: float,
+                         new_sl_price: float, old_order_id: str = None) -> dict:
+        """Cancel existing SL order and place a new one at updated price."""
+        if old_order_id:
+            self.cancel_order(symbol, old_order_id)
+        return self.place_stop_loss(symbol, side, quantity, new_sl_price)
+
+    def update_take_profit(self, symbol: str, side: str, quantity: float,
+                           new_tp_price: float, old_order_id: str = None) -> dict:
+        """Cancel existing TP order and place a new one at updated price."""
+        if old_order_id:
+            self.cancel_order(symbol, old_order_id)
+        return self.place_take_profit(symbol, side, quantity, new_tp_price)
 
     # ─── Position Management ───────────────────────────────────
 

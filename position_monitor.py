@@ -34,7 +34,8 @@ class PositionMonitor:
     def __init__(self, exchange, executor):
         self.exchange = exchange
         self.executor = executor
-        self.tracked = {}  # symbol -> trade info
+        self.tracked = {}        # symbol -> active trade info
+        self.pending = {}        # symbol -> pending limit order info
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
@@ -42,7 +43,8 @@ class PositionMonitor:
 
     def add_position(self, symbol: str, direction: str, entry_price: float,
                      stop_loss: float, take_profit: float, quantity: float,
-                     leverage: int, confidence: int = 0):
+                     leverage: int, confidence: int = 0,
+                     sl_order_id: str = None, tp_order_id: str = None):
         """
         Add a position to monitor. First confirms the position is active
         on the exchange before starting to track.
@@ -55,8 +57,9 @@ class PositionMonitor:
             logger.warning(f"[Monitor] Position not confirmed for {symbol}")
             return False
 
-        breakeven = entry_price * 1.0008 if direction == "LONG" else entry_price * 0.9992
+        breakeven = entry_price * 1.0018 if direction == "LONG" else entry_price * 0.9982  # fees + slippage
         total_distance = abs(take_profit - entry_price)
+        exit_side = "sell" if direction == "LONG" else "buy"
 
         with self._lock:
             self.tracked[symbol] = {
@@ -75,6 +78,9 @@ class PositionMonitor:
                 "best_price": entry_price,
                 "sl_stage": "INITIAL",
                 "max_hold_seconds": 4 * 3600,  # 4 hours default
+                "sl_order_id": sl_order_id,
+                "tp_order_id": tp_order_id,
+                "exit_side": exit_side,
             }
 
         sl_str = f"${stop_loss:,.2f}"
@@ -116,6 +122,37 @@ class PositionMonitor:
             # If we can't check, assume it's there (entry order was filled)
             return True
 
+    def add_pending_order(self, symbol: str, order_id: str, direction: str,
+                          stop_loss: float, take_profit: float, quantity: float,
+                          leverage: int, confidence: int = 0, limit_price: float = 0):
+        """
+        Track a limit order that hasn't filled yet. When it fills, the monitor
+        will automatically place SL/TP and start tracking the position.
+        """
+        with self._lock:
+            self.pending[symbol] = {
+                "order_id": str(order_id),
+                "direction": direction,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "quantity": quantity,
+                "leverage": leverage,
+                "confidence": confidence,
+                "limit_price": limit_price,
+                "placed_at": datetime.now().strftime("%H:%M:%S"),
+                "placed_ts": time.time(),
+            }
+
+        sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
+        dir_color = C.GREEN if direction == "LONG" else C.RED
+        print(f"\n  {C.GREEN}{C.BOLD}LIMIT ORDER PENDING{C.RESET} — {C.CYAN}{sym_short}{C.RESET}")
+        print(f"  {C.DIM}Waiting for fill @ ${limit_price:,.6f}{C.RESET}")
+        print(f"  {C.DIM}Direction: {dir_color}{direction}{C.RESET} | SL: {C.RED}${stop_loss:,.6f}{C.RESET} | TP: {C.GREEN}${take_profit:,.6f}{C.RESET}")
+        print(f"  {C.DIM}When filled → SL/TP placed automatically + trailing stop starts{C.RESET}\n")
+        logger.info(f"[Monitor] Pending limit order {order_id} for {direction} {symbol} @ ${limit_price}")
+
+        self._ensure_running()
+
     def remove_position(self, symbol: str):
         """Stop tracking a position."""
         with self._lock:
@@ -126,6 +163,71 @@ class PositionMonitor:
         """Get all tracked positions with current SL stage."""
         with self._lock:
             return {k: dict(v) for k, v in self.tracked.items()}
+
+    def update_levels(self, symbol: str, new_sl: float = None, new_tp: float = None) -> dict:
+        """
+        Manually update SL and/or TP for a tracked position (e.g. after an
+        AI re-analysis the user confirmed). Updates self.tracked and tries
+        to move the live exchange order; falls back cleanly to software-only
+        monitoring (e.g. on Demo) if the exchange call is skipped/fails.
+        """
+        with self._lock:
+            trade = self.tracked.get(symbol)
+            if not trade:
+                return {"error": f"{symbol} is not being monitored"}
+            trade = dict(trade)
+
+        exit_side = trade.get("exit_side", "sell" if trade["direction"] == "LONG" else "buy")
+        quantity = trade["quantity"]
+        result = {"sl_updated": False, "tp_updated": False}
+
+        if new_sl is not None:
+            new_sl = round(new_sl, 6)
+            old_sl_order_id = trade.get("sl_order_id")
+            new_sl_order_id = old_sl_order_id
+            try:
+                order = self.executor.update_stop_loss(symbol, exit_side, quantity, new_sl, old_sl_order_id)
+                if "error" not in order:
+                    new_sl_order_id = str(order.get("id", old_sl_order_id))
+                    logger.info(f"[Monitor] {symbol} exchange SL manually updated to ${new_sl:,.6f} (order {new_sl_order_id})")
+                else:
+                    logger.warning(f"[Monitor] {symbol} exchange SL update skipped/failed: {order['error']}")
+            except Exception as e:
+                logger.error(f"[Monitor] {symbol} exchange SL update error: {e}")
+
+            with self._lock:
+                if symbol in self.tracked:
+                    self.tracked[symbol]["stop_loss"] = new_sl
+                    self.tracked[symbol]["sl_order_id"] = new_sl_order_id
+            result["sl_updated"] = True
+            result["new_sl"] = new_sl
+
+        if new_tp is not None:
+            new_tp = round(new_tp, 6)
+            old_tp_order_id = trade.get("tp_order_id")
+            new_tp_order_id = old_tp_order_id
+            try:
+                order = self.executor.update_take_profit(symbol, exit_side, quantity, new_tp, old_tp_order_id)
+                if "error" not in order:
+                    new_tp_order_id = str(order.get("id", old_tp_order_id))
+                    logger.info(f"[Monitor] {symbol} exchange TP manually updated to ${new_tp:,.6f} (order {new_tp_order_id})")
+                else:
+                    logger.warning(f"[Monitor] {symbol} exchange TP update skipped/failed: {order['error']}")
+            except Exception as e:
+                logger.error(f"[Monitor] {symbol} exchange TP update error: {e}")
+
+            with self._lock:
+                if symbol in self.tracked:
+                    self.tracked[symbol]["take_profit"] = new_tp
+                    self.tracked[symbol]["tp_order_id"] = new_tp_order_id
+                    # Recompute progress baseline so trailing logic stays consistent
+                    entry = self.tracked[symbol]["entry_price"]
+                    self.tracked[symbol]["total_distance"] = abs(new_tp - entry)
+            result["tp_updated"] = True
+            result["new_tp"] = new_tp
+
+        logger.info(f"[Monitor] {symbol} levels manually updated via reanalysis: {result}")
+        return result
 
     def _ensure_running(self):
         """Start the monitor thread if not already running."""
@@ -138,16 +240,97 @@ class PositionMonitor:
         """Stop the monitor."""
         self._running = False
 
+    def _check_pending_orders(self):
+        """Poll pending limit orders; auto-activate on fill."""
+        with self._lock:
+            pending_symbols = list(self.pending.keys())
+
+        for symbol in pending_symbols:
+            with self._lock:
+                pend = self.pending.get(symbol)
+            if not pend:
+                continue
+
+            try:
+                order = self.exchange.fetch_order(pend["order_id"], symbol)
+                status = order.get("status", "")
+            except Exception as e:
+                logger.error(f"[Monitor] Error fetching pending order {pend['order_id']}: {e}")
+                continue
+
+            if status == "closed":
+                # Order filled — auto-activate
+                with self._lock:
+                    self.pending.pop(symbol, None)
+
+                filled_price = float(order.get("average") or order.get("price") or pend["limit_price"])
+                filled_qty = float(order.get("filled") or pend["quantity"])
+                direction = pend["direction"]
+                sl = pend["stop_loss"]
+                tp = pend["take_profit"]
+                leverage = pend["leverage"]
+                confidence = pend["confidence"]
+                exit_side = "sell" if direction == "LONG" else "buy"
+
+                sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
+                dir_color = C.GREEN if direction == "LONG" else C.RED
+                print(f"\n  {C.GREEN}{C.BOLD}[AI] LIMIT ORDER FILLED — {sym_short}{C.RESET}")
+                print(f"  {dir_color}{direction}{C.RESET} filled @ ${filled_price:,.6f}")
+                print(f"  {C.DIM}Placing SL/TP automatically...{C.RESET}")
+                logger.info(f"[Monitor] Limit order filled: {direction} {symbol} @ ${filled_price}")
+
+                sl_order = self.executor.place_stop_loss(symbol, exit_side, filled_qty, sl)
+                tp_order = self.executor.place_take_profit(symbol, exit_side, filled_qty, tp)
+
+                sl_order_id = str(sl_order["id"]) if "id" in sl_order and "error" not in sl_order else None
+                tp_order_id = str(tp_order["id"]) if "id" in tp_order and "error" not in tp_order else None
+
+                if "error" not in sl_order:
+                    print(f"  {C.GREEN}SL placed @ ${sl:,.6f}{C.RESET}")
+                else:
+                    print(f"  {C.YELLOW}SL order failed (software monitor active): ${sl:,.6f}{C.RESET}")
+
+                if "error" not in tp_order:
+                    print(f"  {C.GREEN}TP placed @ ${tp:,.6f}{C.RESET}")
+                else:
+                    print(f"  {C.YELLOW}TP order failed (software monitor active): ${tp:,.6f}{C.RESET}")
+
+                self.add_position(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=filled_price,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    quantity=filled_qty,
+                    leverage=leverage,
+                    confidence=confidence,
+                    sl_order_id=sl_order_id,
+                    tp_order_id=tp_order_id,
+                )
+                print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
+
+            elif status == "canceled":
+                with self._lock:
+                    self.pending.pop(symbol, None)
+                sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
+                print(f"\n  {C.YELLOW}[Monitor] Pending order for {sym_short} was cancelled.{C.RESET}")
+                print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
+                logger.info(f"[Monitor] Pending order {pend['order_id']} for {symbol} was cancelled")
+
     def _monitor_loop(self):
         """Background loop: check prices, trail stops, trigger exits."""
         while self._running:
             try:
                 with self._lock:
                     symbols = list(self.tracked.keys())
+                    has_pending = bool(self.pending)
 
-                if not symbols:
+                if not symbols and not has_pending:
                     time.sleep(3)
                     continue
+
+                if has_pending:
+                    self._check_pending_orders()
 
                 for symbol in symbols:
                     with self._lock:
@@ -270,11 +453,31 @@ class PositionMonitor:
         stage_changed = new_stage != old_stage
 
         if sl_changed or stage_changed:
+            old_sl_order_id = trade.get("sl_order_id")
+            exit_side = trade.get("exit_side", "sell" if direction == "LONG" else "buy")
+            quantity = trade["quantity"]
+
+            # Auto-update the live exchange SL order
+            new_sl_order_id = old_sl_order_id
+            if sl_changed and self.executor:
+                try:
+                    new_order = self.executor.update_stop_loss(
+                        symbol, exit_side, quantity, round(new_sl, 6), old_sl_order_id
+                    )
+                    if "error" not in new_order:
+                        new_sl_order_id = str(new_order.get("id", old_sl_order_id))
+                        logger.info(f"[Monitor] {symbol} exchange SL updated to ${new_sl:,.2f} (order {new_sl_order_id})")
+                    else:
+                        logger.warning(f"[Monitor] {symbol} exchange SL update failed: {new_order['error']}")
+                except Exception as e:
+                    logger.error(f"[Monitor] {symbol} exchange SL update error: {e}")
+
             with self._lock:
                 if symbol in self.tracked:
                     self.tracked[symbol]["stop_loss"] = round(new_sl, 6)
                     self.tracked[symbol]["best_price"] = best
                     self.tracked[symbol]["sl_stage"] = new_stage
+                    self.tracked[symbol]["sl_order_id"] = new_sl_order_id
 
             # Calculate current P&L
             if direction == "LONG":
@@ -297,7 +500,7 @@ class PositionMonitor:
                 pnl_color = C.GREEN if pnl_pct >= 0 else C.RED
                 sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
 
-                print(f"\n  {color}{C.BOLD}[{sym_short}] SL → {new_stage}{C.RESET}"
+                print(f"\n  {color}{C.BOLD}[AI] [{sym_short}] SL → {new_stage}{C.RESET}"
                       f" | SL: ${new_sl:,.2f}"
                       f" | Price: ${current_price:,.2f}"
                       f" | P&L: {pnl_color}{pnl_pct:+.1f}%{C.RESET}"
@@ -357,6 +560,14 @@ class PositionMonitor:
                 saved = (original_sl - final_sl) * quantity * leverage
             if saved > 0:
                 print(f"  {C.GREEN}Trailing SL saved: ${saved:,.2f}{C.RESET}")
+
+        # Fetch updated balance after close
+        try:
+            new_balance = self.executor.get_total_balance()
+            balance_color = C.GREEN if is_win else C.RED
+            print(f"  Account Balance: {balance_color}{C.BOLD}${new_balance:,.2f} USDT{C.RESET}")
+        except Exception:
+            pass
 
         print(f"{C.BOLD}{'=' * 55}{C.RESET}")
         print(f"\n{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)

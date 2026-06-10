@@ -54,8 +54,8 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
     else:
         return _no_trade("No confirmations met")
 
-    if confidence < 6:
-        return _no_trade(f"Confidence too low ({confidence}/10) — DON'T TRADE. Need 6+ for a valid setup.", reasons=reasons)
+    if confidence < 7:
+        return _no_trade(f"Confidence too low ({confidence}/10) — DON'T TRADE. Need 7+ for a valid setup.", reasons=reasons)
 
     # ─── QUALITY GATE: Require at least one strong confirmation ──
     # A trade must have at least one of:
@@ -69,7 +69,7 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
     has_sr = any("support" in r.lower() or "resistance" in r.lower() for r in reasons if "WARNING" not in r)
 
     quality_checks = sum([has_candle, has_pullback, has_mtf, has_vwap, has_sr])
-    if quality_checks < 2:
+    if quality_checks < 3:
         missing = []
         if not has_candle:
             missing.append("candle pattern")
@@ -79,23 +79,28 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
             missing.append("multi-TF alignment")
         if not has_vwap:
             missing.append("VWAP confirmation")
-        reasons.append(f"QUALITY GATE FAILED: Only {quality_checks}/2 quality confirmations. Missing: {', '.join(missing)}")
-        return _no_trade(f"Not enough quality confirmations ({quality_checks}/2) — NO TRADE", reasons=reasons)
+        if not has_sr:
+            missing.append("S/R level")
+        reasons.append(f"QUALITY GATE FAILED: Only {quality_checks}/3 quality confirmations. Missing: {', '.join(missing)}")
+        return _no_trade(f"Not enough quality confirmations ({quality_checks}/3) — NO TRADE", reasons=reasons)
 
     entry = float(row["close"])
     atr = float(row["atr"])
 
-    # ─── SCALPING SL/TP — wide enough to avoid wicks ────────────
-    # SL: 1.5x ATR (gives room to breathe, avoids wick stops)
-    # TP: 3x ATR (2:1 R:R after accounting for fees)
-    if direction == "LONG":
-        stop_loss = entry - (1.5 * atr)
-        take_profit = entry + (3.0 * atr)
-    else:
-        stop_loss = entry + (1.5 * atr)
-        take_profit = entry - (3.0 * atr)
+    # ─── DYNAMIC SL/TP — scales with confidence ─────────────────
+    # Higher confidence = tighter SL (better entry), wider TP
+    # Lower confidence = wider SL (more room), but still good R:R
+    # Goal: minimum 2.2:1 R:R after fees + slippage
+    sl_mult, tp_mult = _dynamic_atr_multipliers(confidence)
 
-    breakeven = entry * 1.0008
+    if direction == "LONG":
+        stop_loss = entry - (sl_mult * atr)
+        take_profit = entry + (tp_mult * atr)
+    else:
+        stop_loss = entry + (sl_mult * atr)
+        take_profit = entry - (tp_mult * atr)
+
+    breakeven = entry * 1.0018  # fees + slippage
     leverage = _confidence_to_leverage(confidence)
 
     # ─── SCALPING GATE: Must be at a key level ─────────────────
@@ -409,18 +414,31 @@ def check_exit(df: pd.DataFrame, direction: str, entry_price: float,
 
 # ─── Helpers ───────────────────────────────────────────────────
 
-def _confidence_to_leverage(confidence: int) -> int:
-    """Must match risk_manager.get_leverage_for_confidence."""
-    if confidence <= 5:
-        return 0
-    elif confidence == 6:
-        return 5
-    elif confidence == 7:
-        return 10
+def _dynamic_atr_multipliers(confidence: int) -> tuple:
+    """
+    Return (SL multiplier, TP multiplier) based on confidence.
+
+    Higher confidence → tighter SL (better entry quality), wider TP.
+    Must achieve 2.2:1+ AFTER fees+slippage (0.18% friction).
+
+    The raw R:R needs to be ~2.8-3.0+ so that after friction it's still 2.2+.
+
+    Conf 7:  SL 1.5× ATR, TP 4.5× ATR → 3.0:1 raw R:R
+    Conf 8:  SL 1.4× ATR, TP 4.2× ATR → 3.0:1 raw R:R
+    Conf 9+: SL 1.2× ATR, TP 3.6× ATR → 3.0:1 raw R:R
+    """
+    if confidence <= 7:
+        return (1.5, 4.5)
     elif confidence == 8:
-        return 15
-    else:
-        return 20  # Hard cap
+        return (1.4, 4.2)
+    else:  # 9-10
+        return (1.2, 3.6)
+
+
+def _confidence_to_leverage(confidence: int) -> int:
+    """Map confidence to leverage. Capped at 12x for safety."""
+    from risk_manager import get_leverage_for_confidence
+    return get_leverage_for_confidence(confidence)
 
 
 def _no_trade(reason: str, reasons: list = None) -> dict:

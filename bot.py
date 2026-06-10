@@ -21,14 +21,16 @@ from config import (
     get_exchange, print_config, DEFAULT_PAIR, DEFAULT_LEVERAGE,
     SCAN_INTERVAL_MINUTES,
 )
-from fetch_data import get_current_price
+from fetch_data import fetch_ohlcv, get_current_price
 from strategy import evaluate_signal, evaluate_with_mtf
-from risk_manager import validate_trade
+from risk_manager import validate_trade, calculate_take_profit, MIN_RR_BY_TYPE
+from config import MIN_RR_RATIO
 from order_executor import OrderExecutor
 from scanner import scan_top_gainers, print_scan_results
 from trade_tracker import log_trade, print_stats, print_recent_trades
 from position_monitor import PositionMonitor
-from ai_review import get_claude_analysis
+from multi_ai_verifier import analyze_coin_ai, scan_coins_ai, build_indicator_snapshot, verify_trade, reanalyze_position_ai
+from indicators import add_all_indicators, add_higher_tf_indicators
 from logger_setup import get_logger
 
 logger = get_logger("bot")
@@ -37,7 +39,10 @@ exchange = None
 monitor = None
 running = True
 consecutive_losses = 0
-CIRCUIT_BREAKER_LIMIT = 3  # Pause after this many consecutive losses
+daily_pnl = 0.0                # Track daily realized P&L
+session_start_balance = 0.0    # Balance at bot start (for daily loss limit)
+CIRCUIT_BREAKER_LIMIT = 3      # Pause after this many consecutive losses
+MAX_DAILY_LOSS_PCT = 0.05      # 5% max daily drawdown — stop trading
 
 
 # ─── Colors ────────────────────────────────────────────────────
@@ -101,10 +106,11 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 
 # ─── Display helpers ───────────────────────────────────────────
 
-def print_trade_table(signal_data: dict, validation: dict, symbol: str):
+def print_trade_table(signal_data: dict, validation: dict, symbol: str, current_price: float = 0):
     """Print the trade confirmation table."""
     direction = signal_data["direction"]
     dir_color = C.green if direction == "LONG" else C.red
+    entry = validation.get("entry", 0)
 
     print(f"\n{C.bold('=' * 55)}")
     print(f"  {C.bold('TRADE SIGNAL')} — {C.cyan(symbol)}")
@@ -118,11 +124,23 @@ def print_trade_table(signal_data: dict, validation: dict, symbol: str):
         else:
             print(f"    {C.green(f'[{i}]')} {r}")
 
+    # Chase alert — warn if market has moved away from AI entry
+    chase_line = None
+    if current_price and entry:
+        drift_pct = abs(current_price - entry) / entry * 100
+        if drift_pct >= 0.3:
+            label = "above" if current_price > entry else "below"
+            chase_line = (f"\n  {C.red(C.bold('⚠  DO NOT CHASE'))}"
+                          f" — market is {drift_pct:.2f}% {label} AI entry"
+                          f" | AI entry: ${entry:,.6f} | Now: ${current_price:,.6f}")
+
     print(f"\n  {C.bold('TRADE DETAILS:')}")
+    price_display = C.cyan(f"${current_price:,.6f}") if current_price else C.dim("N/A")
     rows = [
         [C.bold("Direction"), dir_color(direction)],
         [C.bold("Confidence"), C.yellow(f"{signal_data['confidence']}/10")],
-        ["Entry", f"${validation['entry']:,.6f}"],
+        [C.bold("Market Price"), price_display],
+        ["AI Entry", f"${entry:,.6f}"],
         ["Stop Loss", C.red(f"${validation['stop_loss']:,.6f}")],
         ["Take Profit", C.green(f"${validation['take_profit']:,.6f}")],
         ["Breakeven", f"${validation['breakeven']:,.6f}"],
@@ -137,6 +155,8 @@ def print_trade_table(signal_data: dict, validation: dict, symbol: str):
         ["Max Hold Time", C.dim(f"{validation.get('max_hold_hours', 4)}h")],
     ]
     print(tabulate(rows, tablefmt="simple"))
+    if chase_line:
+        print(chase_line)
     print(C.bold('=' * 55))
 
 
@@ -195,13 +215,14 @@ def print_trade_result(result: dict, symbol: str, direction: str):
     if has_entry and has_sl and has_tp:
         print(f"\n  {C.green(C.bold('ALL ORDERS PLACED SUCCESSFULLY'))}")
     elif has_entry:
-        warnings = []
+        failed = []
         if not has_sl:
-            warnings.append("Stop Loss")
+            failed.append("SL")
         if not has_tp:
-            warnings.append("Take Profit")
-        print(f"\n  {C.yellow(C.bold('WARNING'))}: Entry filled but {C.red(', '.join(warnings))} failed!")
-        print(f"  {C.yellow('Monitor this position manually or close it.')}")
+            failed.append("TP")
+        failed_str = " & ".join(failed)
+        print(f"\n  {C.yellow(C.bold(f'Exchange {failed_str} orders failed — software trailing stop is active.'))}")
+        print(f"  {C.dim('Position is being monitored automatically. No action needed.')}")
     else:
         print(f"\n  {C.red(C.bold('TRADE FAILED — No position opened.'))}")
     print()
@@ -221,6 +242,7 @@ def print_menu():
     print(f"  {C.cyan('backtest')}  — Run backtest on a coin")
     print(f"  {C.cyan('close')}     — Close a specific position")
     print(f"  {C.cyan('monitored')} — View SL/TP monitored positions")
+    print(f"  {C.cyan('reanalyse')} — Re-analyze an active trade, AI may suggest moving SL/TP")
     print(f"  {C.red('closeall')}  — Emergency close ALL positions")
     print(f"  {C.dim('quit')}      — Shut down bot")
     print(f"  {C.dim('Or type a coin name: btc, eth, sol...')}")
@@ -230,10 +252,24 @@ def print_menu():
 # ─── Core functions ────────────────────────────────────────────
 
 def analyze_coin(symbol: str):
-    """Analyze a single coin and prompt for trade if signal found."""
-    global exchange, executor
+    """
+    AI-driven analysis of a single coin:
+    1. Bot fetches OHLCV data + calculates indicators
+    2. AI analyzes ALL data — decides direction, confidence, SL/TP
+    3. Risk manager validates
+    4. User enters capital + leverage
+    5. User confirms → Execute
+    """
+    global exchange, executor, consecutive_losses, daily_pnl, session_start_balance
 
-    global consecutive_losses
+    # Daily loss limit
+    if session_start_balance > 0:
+        daily_loss_pct = abs(min(daily_pnl, 0)) / session_start_balance
+        if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+            print(f"\n{C.red(C.bold('DAILY LOSS LIMIT REACHED'))}")
+            print(f"  {C.red(f'Daily P&L: ${daily_pnl:+.2f} ({daily_loss_pct*100:.1f}% drawdown)')}")
+            print(f"  {C.dim('Trading paused for today. Type reset to override.')}")
+            return
 
     # Circuit breaker
     if consecutive_losses >= CIRCUIT_BREAKER_LIMIT:
@@ -242,47 +278,167 @@ def analyze_coin(symbol: str):
         print(f"  {C.dim('Type reset to clear the circuit breaker and resume.')}")
         return
 
-    print(f"\n{C.cyan(f'Analyzing {symbol}...')}")
+    print(f"\n{C.cyan(f'Fetching multi-timeframe data for {symbol}...')}")
     try:
         price = get_current_price(symbol, exchange)
-        print(f"Current Price: {C.bold(f'${price:,.2f}')}")
+        print(f"Current Price: {C.bold(f'${price:,.4f}')}")
 
-        signal_data = evaluate_with_mtf(symbol, "5m", exchange)
+        # Fetch ALL timeframes and compute indicators
+        from multi_ai_verifier import ALL_TIMEFRAMES
+        tf_data = {}
+        for tf in ALL_TIMEFRAMES:
+            try:
+                limit = 200 if tf in ["1m", "3m", "5m"] else 100
+                df_tf = fetch_ohlcv(symbol, tf, limit, exchange)
+                df_tf = add_all_indicators(df_tf)
+                tf_data[tf] = df_tf
+                print(f"  {C.dim(f'✓ {tf} — {len(df_tf)} candles')}")
+            except Exception as e:
+                print(f"  {C.dim(f'✗ {tf} — {e}')}")
 
-        if signal_data["direction"] == "NO TRADE":
+        if not tf_data:
+            print(f"{C.red('Failed to fetch any timeframe data.')}")
+            return
+
+        # ─── AI ANALYSIS — AI makes ALL trade decisions ────────
+        ai_signal = analyze_coin_ai(symbol, tf_data)
+
+        direction = ai_signal.get("direction", "NO_TRADE")
+        confidence = ai_signal.get("confidence", 0)
+
+        if direction == "WAIT":
+            wait_dir = ai_signal.get("wait_direction", "?")
+            wait_cond = ai_signal.get("wait_condition", "")
+            entry = ai_signal.get("entry")
+            sl = ai_signal.get("stop_loss")
+            tp = ai_signal.get("take_profit")
+            ai_lev = ai_signal.get("leverage", 5)
+            dir_color = C.green if wait_dir == "LONG" else C.red
+            print(f"Signal: {C.yellow('WAITING FOR SETUP')}")
+            print(f"  {C.bold('Bias:')} {dir_color(wait_dir)} | Confidence: {confidence}/10")
+            if wait_cond:
+                print(f"  {C.bold('Trigger:')} {wait_cond}")
+            if entry and sl and tp:
+                sl_d = abs(entry - sl) / entry * 100
+                tp_d = abs(tp - entry) / entry * 100
+                rr = tp_d / sl_d if sl_d > 0 else 0
+                print(f"  {C.bold('Target entry:')} ${entry:,.6f} | SL: ${sl:,.6f} ({sl_d:.2f}%) | TP: ${tp:,.6f} ({tp_d:.2f}%) | R:R: {rr:.2f}:1 | Lev: {ai_lev}x")
+            for r in ai_signal.get("reasons", []):
+                print(f"  {C.dim('•')} {r}")
+            if ai_signal.get("advice"):
+                print(f"  {C.cyan('Advice:')} {ai_signal['advice']}")
+
+            # Offer to place a limit order at the AI's target entry
+            if entry and sl and tp and monitor:
+                balance = executor.get_total_balance()
+                print(f"\n  {C.cyan(C.bold('Place limit order at AI target entry?'))}")
+                print(f"  {C.dim('When filled, SL/TP + trailing stop activate automatically.')}")
+                print(f"  {C.dim(f'Balance: ${balance:,.2f} | AI suggests {ai_lev}x leverage')}")
+                raw = input(f"  Capital $ to use (or 'no' to skip): ").strip()
+                if raw.lower() in ("no", "n", ""):
+                    return
+
+                # Accept a plain number as capital amount (shortcut — no separate yes/no step)
+                try:
+                    user_capital = float(raw)
+                except ValueError:
+                    print(C.red("Invalid amount. Skipped."))
+                    return
+                if user_capital <= 0:
+                    print(C.red("Capital must be > 0. Skipped."))
+                    return
+
+                lev_input = input(f"  Leverage (Enter for {ai_lev}x, max 12): ").strip()
+                if not lev_input:
+                    user_leverage = min(ai_lev, 12)
+                else:
+                    try:
+                        user_leverage = int(lev_input)
+                    except ValueError:
+                        print(C.red("Invalid leverage. Skipped."))
+                        return
+                if user_leverage <= 0 or user_leverage > 12:
+                    print(C.red("Leverage must be 1-12. Skipped."))
+                    return
+
+                position_size = user_capital * user_leverage
+                quantity = position_size / entry
+
+                executor.set_leverage(symbol, user_leverage)
+                order_side = "buy" if wait_dir == "LONG" else "sell"
+                order = executor.place_limit_order(symbol, order_side, quantity, entry)
+                if "error" in order:
+                    print(f"  {C.red('Limit order failed')}: {order['error']}")
+                    return
+
+                monitor.add_pending_order(
+                    symbol=symbol,
+                    order_id=str(order["id"]),
+                    direction=wait_dir,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    quantity=quantity,
+                    leverage=user_leverage,
+                    confidence=confidence,
+                    limit_price=entry,
+                )
+                logger.info(f"Limit order placed for WAIT signal: {wait_dir} {symbol} @ ${entry} | Order {order['id']}")
+            return
+
+        if direction == "NO_TRADE" or confidence < 7:
             print(f"Signal: {C.yellow('NO TRADE')}")
-            for r in signal_data["reasons"]:
+            if confidence > 0:
+                print(f"  {C.dim(f'Confidence: {confidence}/10 (need 7+)')}")
+            for r in ai_signal.get("reasons", []):
                 print(f"  {C.dim('•')} {r}")
             return
 
-        # Validate trade
+        # Show AI's chosen timeframe and trade type
+        trade_type = ai_signal.get("trade_type", "SCALP")
+        ai_timeframe = ai_signal.get("timeframe", "5m")
+        hold_time = ai_signal.get("hold_time", "")
+        print(f"  {C.cyan(f'Trade type: {trade_type} on {ai_timeframe}')}")
+        if hold_time:
+            print(f"  {C.dim(f'Expected hold: {hold_time}')}")
+
+        entry = ai_signal.get("entry") or price
+        sl = ai_signal.get("stop_loss")
+        tp = ai_signal.get("take_profit")
+
+        if not sl or not tp:
+            print(f"{C.red('AI did not provide SL/TP — cannot trade.')}")
+            return
+
+        # Validate with risk manager
         balance = executor.get_total_balance()
         validation = validate_trade(
             account_balance=balance,
-            entry_price=signal_data["entry"],
-            stop_loss=signal_data["stop_loss"],
-            take_profit=signal_data["take_profit"],
-            confidence=signal_data["confidence"],
-            direction=signal_data["direction"],
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            confidence=confidence,
+            direction=direction,
+            trade_type=trade_type,
         )
 
         if not validation["approved"]:
-            print(f"{C.red('Trade REJECTED')}: {C.red(validation['reason'])}")
+            print(f"{C.red('Trade REJECTED by risk manager')}: {C.red(validation['reason'])}")
+            # Show what TP would be needed to meet minimum R:R
+            if "R:R" in validation["reason"] and sl:
+                required_tp = calculate_take_profit(entry, sl, direction, MIN_RR_BY_TYPE.get(trade_type, MIN_RR_RATIO))
+                sl_dist = abs(entry - sl)
+                tp_dist = abs(required_tp - entry)
+                needed_rr = tp_dist / sl_dist if sl_dist > 0 else 0
+                tp_pct = tp_dist / entry * 100
+                print(f"  {C.yellow('To pass:')} TP must be ${required_tp:,.6f} ({tp_pct:.2f}% from entry) for {needed_rr:.1f}:1 R:R")
+                print(f"  {C.dim('AI set TP at')} ${tp:,.6f} — {C.dim('too close to entry. Wait for a deeper target level.')}")
             return
 
-        # Show trade table
-        print_trade_table(signal_data, validation, symbol)
+        # ─── STEP 1: Capital & Leverage ────────────────────────
+        ai_lev = ai_signal.get("leverage", 5)
+        print(f"\n{C.bold(C.cyan('Set your trade size'))}")
+        print(f"  {C.dim(f'Balance: ${balance:,.2f} | AI suggests {ai_lev}x leverage')}")
 
-        # If strategy suggests waiting
-        entry_type = signal_data.get("entry_type", "MARKET")
-        wait_price = signal_data.get("wait_price")
-        if entry_type == "WAIT" and wait_price:
-            wp = f"${wait_price:,.4f}"
-            print(f"\n  {C.yellow(C.bold('SUGGESTION: WAIT FOR BETTER ENTRY'))}")
-            print(f"  {C.dim('Price is not at a key level. Consider limit order at')} {C.cyan(wp)}")
-
-        # ─── STEP 1: Mandatory Capital & Leverage ──────────────
-        print(f"\n{C.bold(C.cyan('STEP 1: Set your trade size'))}")
         cap_input = input(f"  Capital $ (required): ").strip()
         if not cap_input:
             print(C.yellow("No capital entered. Trade cancelled."))
@@ -296,100 +452,89 @@ def analyze_coin(symbol: str):
             print(C.red("Capital must be > 0. Trade cancelled."))
             return
 
-        lev_input = input(f"  Leverage (required, max 20): ").strip()
+        lev_input = input(f"  Leverage (Enter for {ai_lev}x, max 12): ").strip()
         if not lev_input:
-            print(C.yellow("No leverage entered. Trade cancelled."))
+            user_leverage = min(ai_lev, 12)
+        else:
+            try:
+                user_leverage = int(lev_input)
+            except ValueError:
+                print(C.red("Invalid leverage. Trade cancelled."))
+                return
+        if user_leverage <= 0 or user_leverage > 12:
+            print(C.red("Leverage must be 1-12. Trade cancelled."))
             return
-        try:
-            user_leverage = int(lev_input)
-        except ValueError:
-            print(C.red("Invalid leverage. Trade cancelled."))
-            return
-        if user_leverage <= 0 or user_leverage > 20:
-            print(C.red("Leverage must be 1-20. Trade cancelled."))
-            return
-
-        # Optional: custom SL/TP
-        custom_sl = input(f"  Stop Loss (Enter to keep ${validation['stop_loss']:,.4f}): ").strip()
-        custom_tp = input(f"  Take Profit (Enter to keep ${validation['take_profit']:,.4f}): ").strip()
-        if custom_sl:
-            validation["stop_loss"] = float(custom_sl)
-        if custom_tp:
-            validation["take_profit"] = float(custom_tp)
 
         # Recalculate with user's values
         position_size = user_capital * user_leverage
-        quantity = position_size / validation["entry"]
+        quantity = position_size / entry
         validation["leverage"] = user_leverage
         validation["quantity"] = quantity
         validation["position_size"] = round(position_size, 2)
 
-        # Recalculate R:R
-        sl_dist = abs(validation["entry"] - validation["stop_loss"])
-        tp_dist = abs(validation["take_profit"] - validation["entry"])
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
         validation["rr_ratio"] = round(tp_dist / sl_dist, 1) if sl_dist > 0 else 0
-        validation["fees"] = round(position_size * 0.0008, 2)
+        validation["fees"] = round(position_size * 0.0018, 2)
 
         pos_str = f"${position_size:,.2f}"
         margin_str = f"${user_capital:,.2f}"
         print(f"\n  {C.bold('Your setup:')} {margin_str} x {user_leverage}x = {C.cyan(pos_str)} position")
 
-        # ─── STEP 2: Claude AI Review ──────────────────────────
-        print(f"\n{C.bold(C.cyan('STEP 2: AI Second Opinion'))}")
-        ai_result = get_claude_analysis(
-            symbol=symbol,
-            signal=signal_data,
-            capital=user_capital,
-            leverage=user_leverage,
-            balance=balance,
-        )
+        # Optional: custom SL/TP override
+        custom_sl = input(f"  Custom Stop Loss? (Enter to keep ${sl:,.6f}): ").strip()
+        custom_tp = input(f"  Custom Take Profit? (Enter to keep ${tp:,.6f}): ").strip()
+        if custom_sl:
+            sl = float(custom_sl)
+            validation["stop_loss"] = sl
+        if custom_tp:
+            tp = float(custom_tp)
+            validation["take_profit"] = tp
 
-        if not ai_result["approved"]:
-            print(f"\n  {C.red(C.bold('Claude says NO.'))}")
-            override = input(f"  Override AI rejection? (yes/no): ").strip().lower()
-            if override not in ("yes", "y"):
-                print(C.yellow("Trade cancelled based on AI review."))
-                logger.info(f"Trade cancelled by AI review: {symbol}")
+        if custom_sl or custom_tp:
+            sl_dist = abs(entry - sl)
+            tp_dist = abs(tp - entry)
+            validation["rr_ratio"] = round(tp_dist / sl_dist, 1) if sl_dist > 0 else 0
+
+        # Build signal_data for display
+        signal_data = {
+            "direction": direction,
+            "confidence": confidence,
+            "reasons": ai_signal.get("reasons", []),
+        }
+
+        # ─── Show final trade table & confirm ──────────────────
+        # Refresh price just before confirm to catch any drift since analysis
+        try:
+            price = get_current_price(symbol, exchange)
+        except Exception:
+            pass
+        print_trade_table(signal_data, validation, symbol, current_price=price)
+
+        # Anti-chase guard — warn hard if market has run away from AI entry
+        drift_pct = abs(price - entry) / entry * 100 if entry else 0
+        if drift_pct >= 0.5:
+            chase_dir = "above" if price > entry else "below"
+            print(f"\n  {C.red(C.bold('DO NOT CHASE — price moved {:.2f}% {} since AI entry'.format(drift_pct, chase_dir)))}")
+            print(f"  {C.dim('Use wait to set a limit order at the original entry instead.')}")
+            confirm = input(f"\n{C.bold('Override chase & execute anyway? (yes to force / wait for limit / no):')} ").strip().lower()
+            if confirm not in ("yes", "y", "wait", "w"):
+                print(C.yellow("Smart call. Trade cancelled."))
                 return
-            print(f"  {C.yellow('Overriding AI — proceeding at your own risk.')}")
-
-        # Apply AI adjustments if any
-        if ai_result.get("adjustments"):
-            adj = ai_result["adjustments"]
-            if "stop_loss" in adj:
-                ai_sl = adj["stop_loss"]
-                cur_sl = validation["stop_loss"]
-                print(f"  {C.yellow(f'AI suggests SL: ${ai_sl}')} (yours: ${cur_sl:,.4f})")
-                use_ai_sl = input(f"  Use AI's SL? (yes/no): ").strip().lower()
-                if use_ai_sl in ("yes", "y"):
-                    validation["stop_loss"] = float(ai_sl)
-            if "take_profit" in adj:
-                ai_tp = adj["take_profit"]
-                cur_tp = validation["take_profit"]
-                print(f"  {C.yellow(f'AI suggests TP: ${ai_tp}')} (yours: ${cur_tp:,.4f})")
-                use_ai_tp = input(f"  Use AI's TP? (yes/no): ").strip().lower()
-                if use_ai_tp in ("yes", "y"):
-                    validation["take_profit"] = float(ai_tp)
-            if "leverage" in adj:
-                ai_lev = int(adj["leverage"])
-                print(f"  {C.yellow(f'AI suggests {ai_lev}x leverage')} (yours: {user_leverage}x)")
-                use_ai_lev = input(f"  Use AI's leverage? (yes/no): ").strip().lower()
-                if use_ai_lev in ("yes", "y"):
-                    user_leverage = ai_lev
-                    validation["leverage"] = ai_lev
-                    position_size = user_capital * user_leverage
-                    validation["quantity"] = position_size / validation["entry"]
-                    validation["position_size"] = round(position_size, 2)
-
-        # ─── STEP 3: Final Confirmation ────────────────────────
-        print(f"\n{C.bold(C.cyan('STEP 3: Final Confirmation'))}")
-        print_trade_table(signal_data, validation, symbol)
-        confirm = input(f"\n{C.bold('EXECUTE NOW? (yes/no/wait):')} ").strip().lower()
+        else:
+            confirm = input(f"\n{C.bold('EXECUTE NOW? (yes/no/wait):')} ").strip().lower()
 
         if confirm in ("wait", "w"):
-            # Place limit order
-            if wait_price:
-                limit_price = wait_price
+            ai_entry = ai_signal.get("entry")
+            if ai_entry and abs(ai_entry - price) > 0.001:
+                default_limit = ai_entry
+                print(f"  {C.dim(f'AI suggested entry: ${default_limit:,.6f}')}")
+            else:
+                default_limit = None
+
+            if default_limit:
+                lp_input = input(f"  Limit price (Enter for ${default_limit:,.6f}): ").strip()
+                limit_price = float(lp_input) if lp_input else default_limit
             else:
                 lp_input = input(f"  Limit price: ").strip()
                 if not lp_input:
@@ -398,27 +543,27 @@ def analyze_coin(symbol: str):
                 limit_price = float(lp_input)
 
             executor.set_leverage(symbol, user_leverage)
-            side = "buy" if signal_data["direction"] == "LONG" else "sell"
-            order = executor.place_limit_order(symbol, side, validation["quantity"], limit_price)
+            side = "buy" if direction == "LONG" else "sell"
+            order = executor.place_limit_order(symbol, side, quantity, limit_price)
             if "error" in order:
                 print(f"  {C.red('ERROR')}: {C.red(order['error'])}")
             else:
-                lp_str = f"${limit_price:,.4f}"
+                lp_str = f"${limit_price:,.6f}"
                 print(f"  {C.green(C.bold('LIMIT ORDER PLACED'))}")
                 print(f"  Waiting for price to reach {C.cyan(lp_str)}")
             return
 
         if confirm in ("yes", "y"):
-            logger.info(f"Trade confirmed: {signal_data['direction']} {symbol} | Capital: ${user_capital} | Leverage: {user_leverage}x")
+            logger.info(f"Trade confirmed: {direction} {symbol} | Capital: ${user_capital} | Leverage: {user_leverage}x")
             print(f"\n{C.yellow('Placing orders...')}")
 
             result = executor.execute_trade(
                 symbol=symbol,
-                direction=signal_data["direction"],
-                quantity=validation["quantity"],
-                leverage=validation["leverage"],
-                stop_loss=validation["stop_loss"],
-                take_profit=validation["take_profit"],
+                direction=direction,
+                quantity=quantity,
+                leverage=user_leverage,
+                stop_loss=sl,
+                take_profit=tp,
             )
 
             if "error" in result:
@@ -427,45 +572,238 @@ def analyze_coin(symbol: str):
             else:
                 logger.info(f"Trade executed on {symbol}")
                 try:
-                    print_trade_result(result, symbol, signal_data["direction"])
+                    print_trade_result(result, symbol, direction)
                 except Exception as e:
                     print(f"{C.green('Trade placed!')} (display error: {e})")
 
                 # Start position monitor with trailing SL
                 if monitor:
                     try:
-                        entry_price = float(result["entry"].get("average") or result["entry"].get("price") or validation["entry"])
-                        filled_qty = float(result["entry"].get("filled") or result["entry"].get("amount") or validation["quantity"])
+                        entry_price = float(result["entry"].get("average") or result["entry"].get("price") or entry)
+                        filled_qty = float(result["entry"].get("filled") or result["entry"].get("amount") or quantity)
                     except (TypeError, ValueError):
-                        entry_price = validation["entry"]
-                        filled_qty = validation["quantity"]
+                        entry_price = entry
+                        filled_qty = quantity
+
+                    sl_result = result.get("stop_loss", {})
+                    tp_result = result.get("take_profit", {})
+                    sl_order_id = str(sl_result["id"]) if "id" in sl_result and "error" not in sl_result else None
+                    tp_order_id = str(tp_result["id"]) if "id" in tp_result and "error" not in tp_result else None
+
+                    # Set max hold based on AI trade type
+                    hold_map = {"SCALP": 1, "INTRADAY": 4, "SWING": 24}
+                    max_hold_h = hold_map.get(trade_type, 4)
+
                     monitor.add_position(
                         symbol=symbol,
-                        direction=signal_data["direction"],
+                        direction=direction,
                         entry_price=entry_price,
-                        stop_loss=validation["stop_loss"],
-                        take_profit=validation["take_profit"],
+                        stop_loss=sl,
+                        take_profit=tp,
                         quantity=filled_qty,
-                        leverage=validation["leverage"],
-                        confidence=signal_data["confidence"],
+                        leverage=user_leverage,
+                        confidence=confidence,
+                        sl_order_id=sl_order_id,
+                        tp_order_id=tp_order_id,
                     )
+                    # Update max hold time based on trade type
+                    if symbol in monitor.tracked:
+                        monitor.tracked[symbol]["max_hold_seconds"] = max_hold_h * 3600
         else:
             print(C.yellow("Trade skipped."))
-            logger.info(f"Trade skipped by user: {signal_data['direction']} {symbol}")
+            logger.info(f"Trade skipped by user: {direction} {symbol}")
 
     except Exception as e:
         logger.error(f"Error analyzing {symbol}: {e}")
         print(f"{C.red(C.bold('ERROR'))}: {C.red(str(e))}")
 
 
+def reanalyze_position(symbol: str):
+    """
+    Re-analyze an ALREADY-OPEN, monitored position with fresh multi-timeframe
+    data and the trade's current state. AI suggests HOLD / MOVE_SL / MOVE_TP /
+    MOVE_BOTH / CLOSE_NOW. SL/TP changes and closes require user confirmation
+    before being applied to the live trade.
+    """
+    global exchange, executor, monitor
+
+    if not monitor:
+        print(C.red("Position monitor not running."))
+        return
+
+    trade = monitor.get_tracked().get(symbol)
+
+    if not trade:
+        # Not tracked in-memory (e.g. bot was restarted) — check if it's an
+        # open position on the exchange and offer to start monitoring it.
+        positions = executor.get_open_positions()
+        exch_pos = next(
+            (p for p in positions if p.get("symbol", "").split(":")[0] == symbol
+             and float(p.get("contracts", 0)) > 0),
+            None,
+        )
+        if not exch_pos:
+            print(f"{C.yellow(f'{symbol} is not an active position.')}")
+            print(f"  {C.dim('Use')} {C.cyan('monitored')} {C.dim('or')} {C.cyan('positions')} {C.dim('to see active positions.')}")
+            return
+
+        direction = "LONG" if exch_pos.get("side") == "long" else "SHORT"
+        entry_price = float(exch_pos.get("entryPrice", 0))
+        quantity = float(exch_pos.get("contracts", 0))
+        leverage = int(float(exch_pos.get("leverage", 1) or 1))
+
+        print(f"\n{C.yellow(f'{symbol} is open on the exchange but not being monitored')} {C.dim('(bot restarted?)')}")
+        print(f"  {C.dim(f'{direction} | Entry: ${entry_price:,.6f} | Qty: {quantity} | Leverage: {leverage}x')}")
+        print(f"  {C.dim('Enter the current SL/TP so the AI can re-analyze and live monitoring can resume.')}")
+
+        sl_input = input(f"  Current Stop Loss price: ").strip()
+        tp_input = input(f"  Current Take Profit price: ").strip()
+        try:
+            stop_loss = float(sl_input)
+            take_profit = float(tp_input)
+        except ValueError:
+            print(C.red("Invalid SL/TP. Cancelled."))
+            return
+
+        if not monitor.add_position(symbol, direction, entry_price, stop_loss, take_profit, quantity, leverage):
+            print(C.red("Could not start monitoring this position."))
+            return
+
+        trade = monitor.get_tracked().get(symbol)
+        if not trade:
+            print(C.red("Could not start monitoring this position."))
+            return
+
+    print(f"\n{C.cyan(f'Fetching fresh multi-timeframe data for {symbol}...')}")
+    try:
+        price = get_current_price(symbol, exchange)
+        print(f"Current Price: {C.bold(f'${price:,.4f}')}")
+
+        from multi_ai_verifier import ALL_TIMEFRAMES
+        tf_data = {}
+        for tf in ALL_TIMEFRAMES:
+            try:
+                limit = 200 if tf in ["1m", "3m", "5m"] else 100
+                df_tf = fetch_ohlcv(symbol, tf, limit, exchange)
+                df_tf = add_all_indicators(df_tf)
+                tf_data[tf] = df_tf
+                print(f"  {C.dim(f'✓ {tf} — {len(df_tf)} candles')}")
+            except Exception as e:
+                print(f"  {C.dim(f'✗ {tf} — {e}')}")
+
+        if not tf_data:
+            print(f"{C.red('Failed to fetch any timeframe data.')}")
+            return
+
+        direction = trade["direction"]
+        entry = trade["entry_price"]
+        leverage = trade["leverage"]
+        if direction == "LONG":
+            pnl_pct = ((price - entry) / entry) * leverage * 100
+        else:
+            pnl_pct = ((entry - price) / entry) * leverage * 100
+
+        elapsed = time.time() - trade.get("opened_ts", time.time())
+        hours, rem_secs = divmod(int(elapsed), 3600)
+        minutes = rem_secs // 60
+        hold_time = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+        position_info = {
+            "direction": direction,
+            "entry_price": entry,
+            "current_price": price,
+            "stop_loss": trade["stop_loss"],
+            "take_profit": trade["take_profit"],
+            "leverage": leverage,
+            "pnl_pct": pnl_pct,
+            "sl_stage": trade.get("sl_stage", "INITIAL"),
+            "hold_time": hold_time,
+        }
+
+        verdict = reanalyze_position_ai(symbol, tf_data, position_info)
+
+        action = verdict.get("action", "HOLD")
+        new_sl = verdict.get("new_stop_loss")
+        new_tp = verdict.get("new_take_profit")
+
+        if action == "HOLD":
+            print(C.green("AI recommends holding the position as-is. No changes made."))
+            return
+
+        if action == "CLOSE_NOW":
+            confirm = input(f"\n{C.red(C.bold('AI recommends CLOSING NOW. Close position? (yes/no):'))} ").strip().lower()
+            if confirm in ("yes", "y"):
+                result = executor.close_position(symbol)
+                if "error" in result:
+                    print(f"{C.red('Error')}: {C.red(result['error'])}")
+                elif "info" in result:
+                    print(C.yellow(result["info"]))
+                elif result.get("closed"):
+                    monitor.remove_position(symbol)
+                    pnl = result["pnl"]
+                    pnl_color = C.green if pnl >= 0 else C.red
+                    print(f"\n{C.bold('─' * 45)}")
+                    print(f"  {C.bold('POSITION CLOSED')} — {C.cyan(symbol)}")
+                    print(f"{C.bold('─' * 45)}")
+                    print(f"  Entry:       ${result['entry_price']:,.2f}")
+                    print(f"  Close:       ${result['close_price']:,.2f}")
+                    print(f"  P&L:         {pnl_color(f'${pnl:+.2f}')}")
+                    print(f"{C.bold('─' * 45)}\n")
+                    logger.info(f"Position {symbol} closed via reanalyze CLOSE_NOW")
+            else:
+                print(C.yellow("Position kept open."))
+            return
+
+        # MOVE_SL / MOVE_TP / MOVE_BOTH
+        changes = []
+        if action in ("MOVE_SL", "MOVE_BOTH") and new_sl:
+            changes.append(f"  SL: ${trade['stop_loss']:,.6f} -> {C.cyan(f'${new_sl:,.6f}')}")
+        if action in ("MOVE_TP", "MOVE_BOTH") and new_tp:
+            changes.append(f"  TP: ${trade['take_profit']:,.6f} -> {C.cyan(f'${new_tp:,.6f}')}")
+
+        if not changes:
+            print(C.yellow("AI suggested an adjustment but did not provide valid new levels. No changes made."))
+            return
+
+        print(f"\n{C.bold('Suggested changes:')}")
+        for c in changes:
+            print(c)
+
+        confirm = input(f"\n{C.cyan(C.bold('Apply these changes to the live trade? (yes/no):'))} ").strip().lower()
+        if confirm not in ("yes", "y"):
+            print(C.yellow("No changes applied."))
+            return
+
+        sl_arg = new_sl if action in ("MOVE_SL", "MOVE_BOTH") and new_sl else None
+        tp_arg = new_tp if action in ("MOVE_TP", "MOVE_BOTH") and new_tp else None
+
+        result = monitor.update_levels(symbol, new_sl=sl_arg, new_tp=tp_arg)
+        if "error" in result:
+            print(f"{C.red('Error')}: {C.red(result['error'])}")
+            return
+
+        if result.get("sl_updated"):
+            print(f"  {C.green('SL updated to')} ${result['new_sl']:,.6f}")
+        if result.get("tp_updated"):
+            print(f"  {C.green('TP updated to')} ${result['new_tp']:,.6f}")
+
+        logger.info(f"Position {symbol} levels updated via reanalyze: {result}")
+
+    except Exception as e:
+        logger.error(f"Error reanalyzing {symbol}: {e}")
+        print(f"{C.red(C.bold('ERROR'))}: {C.red(str(e))}")
+
+
 def scan_all_coins():
     """
-    Scan ALL major Binance Futures coins, run full pattern analysis
-    with multi-timeframe on each, and show only the safest trades.
+    AI-driven scan of ALL major Binance Futures coins:
+    1. Bot fetches data + indicators for all coins
+    2. Bot pre-filters (basic trend + volume check)
+    3. Sends pre-filtered candidates to AI in ONE batch prompt
+    4. AI picks the best 3 setups with full SL/TP
     """
     global exchange
 
-    # Coins confirmed available on Binance Futures Demo
     ALL_COINS = [
         "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
         "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
@@ -479,94 +817,157 @@ def scan_all_coins():
 
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n{C.bold(C.cyan(f'[{ts}] SCANNING ALL {len(ALL_COINS)} COINS...'))}")
-    print(f"{C.dim('This may take 1-2 minutes — analyzing patterns + multi-timeframe on each coin')}\n")
+    print(f"{C.dim('Phase 1: Fetching data + pre-filtering...')}\n")
     logger.info(f"allCoins scan started ({len(ALL_COINS)} coins)")
 
-    results = []
+    # Phase 1: Fetch 5m data and pre-filter
+    from multi_ai_verifier import ALL_TIMEFRAMES
+    pre_filtered = []
     for i, symbol in enumerate(ALL_COINS):
         short_name = symbol.replace("/USDT", "")
         progress = f"[{i+1}/{len(ALL_COINS)}]"
-        print(f"  {C.dim(progress)} Analyzing {short_name}...", end="", flush=True)
+        print(f"  {C.dim(progress)} {short_name}...", end="", flush=True)
 
         try:
-            signal = evaluate_with_mtf(symbol, "5m", exchange)
+            df = fetch_ohlcv(symbol, "5m", 200, exchange)
+            df = add_all_indicators(df)
 
-            if signal["direction"] != "NO TRADE" and signal["confidence"] >= 6:
-                results.append({
-                    "symbol": symbol,
-                    "signal": signal,
-                })
-                dir_color = C.green if signal["direction"] == "LONG" else C.red
-                print(f" {dir_color(signal['direction'])} (conf {signal['confidence']}/10)")
-            else:
-                print(f" {C.dim('no setup')}")
+            if len(df) < 50:
+                print(f" {C.dim('insufficient data')}")
+                continue
+
+            row = df.iloc[-1]
+
+            # Basic pre-filter: must have trend + volume + not overextended
+            has_trend = (row["ema_9"] != row["ema_21"])  # EMAs not equal
+            has_volume = row["vol_sma_20"] > 0 and row["volume"] > 0.5 * row["vol_sma_20"]
+            not_overextended = not row.get("overextended", False)
+            rsi_ok = 25 <= row.get("rsi", 50) <= 75
+
+            if not (has_trend and has_volume and not_overextended and rsi_ok):
+                print(f" {C.dim('filtered out')}")
+                continue
+
+            trend_dir = "BULL" if row["ema_9"] > row["ema_21"] else "BEAR"
+            pre_filtered.append({"symbol": symbol, "trend": trend_dir})
+            print(f" {C.yellow(f'candidate ({trend_dir})')}")
+
         except Exception as e:
             print(f" {C.red('error')}")
             logger.error(f"allCoins error on {symbol}: {e}")
 
-    # Sort by confidence (highest first)
-    results.sort(key=lambda x: x["signal"]["confidence"], reverse=True)
+    print(f"\n{C.bold(f'Pre-filter: {len(pre_filtered)}/{len(ALL_COINS)} coins passed')}")
 
-    print(f"\n{C.bold('=' * 65)}")
-    print(f"  {C.bold(C.cyan('ALL COINS SCAN RESULTS'))}")
-    print(f"{C.bold('=' * 65)}")
-
-    if not results:
-        print(f"\n  {C.yellow(C.bold('NO SAFE TRADES FOUND'))}")
-        print(f"  {C.dim('All coins failed the quality gate or had low confidence.')}")
-        print(f"  {C.dim('This is normal — a good strategy waits for the right setup.')}")
-        print(f"{C.bold('=' * 65)}\n")
-        logger.info("allCoins scan complete — no trades found")
+    if not pre_filtered:
+        print(f"\n  {C.yellow(C.bold('NO CANDIDATES'))}")
+        print(f"  {C.dim('All coins filtered out. No clear trends or volume.')}")
+        logger.info("allCoins scan — no candidates passed pre-filter")
         return
 
-    # Show results table
-    table_data = []
-    for r in results:
-        sig = r["signal"]
-        sym = r["symbol"].replace("/USDT", "")
-        dir_color = C.green if sig["direction"] == "LONG" else C.red
-        htf_trend = sig.get("htf_trend", "?")
-        htf_color = C.green if htf_trend == "BULLISH" else (C.red if htf_trend == "BEARISH" else C.dim)
+    # Phase 1.5: Fetch all TFs for candidates only
+    print(f"\n{C.dim('Fetching multi-timeframe data for candidates...')}")
+    candidates = []
+    for item in pre_filtered:
+        symbol = item["symbol"]
+        short_name = symbol.replace("/USDT", "")
+        print(f"  {C.dim(short_name)}:", end="", flush=True)
 
-        # Count quality indicators
-        reasons = sig["reasons"]
-        has_candle = "Y" if any(k in r2 for r2 in reasons for k in ["Engulfing", "Hammer", "Pin Bar", "Star"]) else "-"
-        has_pullback = "Y" if any("Pullback" in r2 for r2 in reasons) else "-"
+        tf_data = {}
+        for tf in ALL_TIMEFRAMES:
+            try:
+                limit = 200 if tf in ["1m", "3m", "5m"] else 100
+                df_tf = fetch_ohlcv(symbol, tf, limit, exchange)
+                df_tf = add_all_indicators(df_tf)
+                tf_data[tf] = df_tf
+                print(f" {C.dim(tf)}", end="", flush=True)
+            except Exception:
+                pass
+
+        if tf_data:
+            snapshot = build_indicator_snapshot(tf_data, symbol)
+            candidates.append({"symbol": symbol, "snapshot": snapshot})
+            print(f" {C.green('✓')}")
+        else:
+            print(f" {C.red('✗')}")
+
+    print(f"\n{C.bold(f'Pre-filter: {len(candidates)}/{len(ALL_COINS)} coins passed')}")
+
+    if not candidates:
+        print(f"\n  {C.yellow(C.bold('NO CANDIDATES'))}")
+        print(f"  {C.dim('All coins filtered out. No clear trends or volume.')}")
+        logger.info("allCoins scan — no candidates passed pre-filter")
+        return
+
+    # Phase 2: Send to AI
+    print(f"\n{C.dim('Phase 2: Sending candidates to AI for analysis...')}")
+    ai_picks = scan_coins_ai(candidates)
+
+    if not ai_picks:
+        print(f"\n  {C.yellow(C.bold('AI found NO safe trade setups.'))}")
+        print(f"  {C.dim('This is normal — a good strategy waits for the right setup.')}")
+        logger.info("allCoins scan — AI found no setups")
+        return
+
+    # Display AI picks
+    print(f"\n{C.bold('=' * 65)}")
+    print(f"  {C.bold(C.cyan('AI TRADE PICKS'))}")
+    print(f"{C.bold('=' * 65)}")
+
+    table_data = []
+    for p in ai_picks:
+        sym = p["symbol"].replace("/USDT", "")
+        dir_color = C.green if p["direction"] == "LONG" else C.red
+        entry = p.get("entry", 0)
+        sl = p.get("stop_loss", 0)
+        tp = p.get("take_profit", 0)
+        risk = p.get("risk_score", "?")
+        r_color = C.green if risk == "LOW" else (C.yellow if risk == "MEDIUM" else C.red)
+
+        # Calculate R:R
+        if entry and sl and tp:
+            sl_d = abs(entry - sl)
+            tp_d = abs(tp - entry)
+            rr = f"{tp_d/sl_d:.1f}:1" if sl_d > 0 else "?"
+        else:
+            rr = "?"
+
+        tt = p.get("trade_type", "SCALP")
+        ai_tf = p.get("timeframe", "5m")
 
         table_data.append([
             sym,
-            dir_color(sig["direction"]),
-            C.yellow(f"{sig['confidence']}/10"),
-            f"${sig['entry']:,.2f}",
-            C.red(f"${sig['stop_loss']:,.2f}"),
-            C.green(f"${sig['take_profit']:,.2f}"),
-            htf_color(htf_trend),
-            has_candle,
-            has_pullback,
+            dir_color(p["direction"]),
+            C.yellow(f"{p['confidence']}/10"),
+            f"{tt}/{ai_tf}",
+            f"${entry:,.4f}" if entry else "-",
+            C.red(f"${sl:,.4f}") if sl else "-",
+            C.green(f"${tp:,.4f}") if tp else "-",
+            rr,
+            r_color(risk),
         ])
 
     print(tabulate(table_data, headers=[
-        "Coin", "Signal", "Conf", "Entry", "SL", "TP", "HTF Trend", "Candle", "Pullback"
+        "Coin", "Signal", "Conf", "Type/TF", "Entry", "SL", "TP", "R:R", "Risk"
     ], tablefmt="simple"))
 
-    print(f"\n  {C.green(f'Found {len(results)} trade setup(s)')}")
+    print(f"\n  {C.green(f'AI selected {len(ai_picks)} setup(s)')}")
     print(f"{C.bold('=' * 65)}")
 
-    # Show detailed analysis for the best trade
-    best = results[0]
-    best_sig = best["signal"]
+    # Show reasons for the best pick
+    best = ai_picks[0]
     best_sym = best["symbol"]
-
     print(f"\n{C.bold(C.cyan(f'BEST SETUP: {best_sym}'))}")
     print(f"{C.dim('─' * 55)}")
-    for i, r in enumerate(best_sig["reasons"], 1):
-        if "WARNING" in r or "REJECTED" in r:
+    for i, r in enumerate(best.get("reasons", []), 1):
+        if any(kw in r.upper() for kw in ["WARNING", "RISK", "DANGER"]):
             print(f"  {C.red(f'[{i}]')} {C.red(r)}")
         else:
             print(f"  {C.green(f'[{i}]')} {r}")
+    advice = best.get("advice", "")
+    if advice:
+        print(f"  {C.cyan(f'Advice: {advice}')}")
     print(f"{C.dim('─' * 55)}")
 
-    # Ask if user wants to trade the best one
     print(f"\n{C.dim('Type the coin name to analyze and trade it, or press Enter to skip.')}")
 
 
@@ -583,8 +984,8 @@ def run_scanner():
     results = scan_top_gainers(exchange=exchange)
     print_scan_results(results)
 
-    # Process signals with confidence >= 5
-    actionable = [r for r in results if r["confidence"] >= 5]
+    # Process signals with confidence >= 7
+    actionable = [r for r in results if r["confidence"] >= 7]
     if not actionable:
         print(C.yellow("No actionable signals found."))
         logger.info("Scanner complete — no actionable signals")
@@ -605,6 +1006,7 @@ def run_scanner():
             take_profit=r["take_profit"],
             confidence=r["confidence"],
             direction=r["signal"],
+            trade_type=r.get("trade_type", "SCALP"),
         )
 
         if not validation["approved"]:
@@ -617,7 +1019,8 @@ def run_scanner():
             "confidence": r["confidence"],
             "reasons": r["reasons"],
         }
-        print_trade_table(signal_data, validation, symbol)
+        scan_price = r.get("entry", 0)
+        print_trade_table(signal_data, validation, symbol, current_price=scan_price)
 
         prompt_text = f"Execute {sig} on {symbol}? (yes/no/skip-all):"
         confirm = input(f"\n{C.bold(prompt_text)} ").strip().lower()
@@ -648,6 +1051,10 @@ def run_scanner():
                     except (TypeError, ValueError):
                         entry_price = validation["entry"]
                         filled_qty = validation["quantity"]
+                    sl_result = result.get("stop_loss", {})
+                    tp_result = result.get("take_profit", {})
+                    sl_order_id = str(sl_result["id"]) if "id" in sl_result and "error" not in sl_result else None
+                    tp_order_id = str(tp_result["id"]) if "id" in tp_result and "error" not in tp_result else None
                     monitor.add_position(
                         symbol=symbol, direction=sig,
                         entry_price=entry_price,
@@ -655,6 +1062,8 @@ def run_scanner():
                         take_profit=validation["take_profit"],
                         quantity=filled_qty, leverage=validation["leverage"],
                         confidence=conf,
+                        sl_order_id=sl_order_id,
+                        tp_order_id=tp_order_id,
                     )
         elif confirm == "skip-all":
             print(C.yellow("Skipping remaining signals."))
@@ -668,7 +1077,7 @@ def run_scanner():
 # ─── Main loop ─────────────────────────────────────────────────
 
 def main():
-    global exchange, executor, monitor, running
+    global exchange, executor, monitor, running, session_start_balance
 
     print(f"\n{C.BOLD}{C.CYAN}{'=' * 50}")
     print(f"  CRYPTO TRADING BOT v1.0")
@@ -686,6 +1095,7 @@ def main():
     # Check connection
     try:
         balance = executor.get_total_balance()
+        session_start_balance = balance
         print(f"{C.green('Connected!')} USDT Balance: {C.bold(f'${balance:.2f}')}")
         logger.info(f"Bot started. Balance: ${balance:.2f}")
     except Exception as e:
@@ -785,6 +1195,16 @@ def main():
                 else:
                     print(C.dim("No positions being monitored."))
 
+            elif cmd in ("reanalyse", "reanalyze") or cmd.startswith(("reanalyse ", "reanalyze ")):
+                if " " in cmd:
+                    coin = cmd.split(" ", 1)[1].strip().upper()
+                else:
+                    coin = input(f"Enter active trade's coin (e.g. BTC/USDT): ").strip().upper()
+                if coin and "/" not in coin:
+                    coin = coin + "/USDT"
+                if coin:
+                    reanalyze_position(coin)
+
             elif cmd == "backtest":
                 from backtest import backtest as run_backtest, print_backtest_results
                 coin = input("Coin (e.g. BTC/USDT): ").strip().upper()
@@ -840,7 +1260,8 @@ def main():
 
             elif cmd == "reset":
                 consecutive_losses = 0
-                print(C.green("Circuit breaker reset. Trading resumed."))
+                daily_pnl = 0.0
+                print(C.green("Circuit breaker & daily loss limit reset. Trading resumed."))
 
             elif cmd == "help":
                 print_menu()

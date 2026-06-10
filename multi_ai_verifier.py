@@ -22,11 +22,14 @@ Setup:
 
 import os
 import json
+import re
 import time
 import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger_setup import get_logger
+from risk_manager import MIN_RR_BY_TYPE
+from trade_tracker import format_confidence_stats_text
 
 logger = get_logger("multi_ai")
 
@@ -41,6 +44,30 @@ BLUE = "\033[94m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+
+# ─── Hold time by trade type ──────────────────────────────────
+# AI's free-text "hold_time" field tends to anchor on the "2h" example in the
+# prompt regardless of trade_type. Derive a consistent estimate from
+# trade_type instead, which the AI gets right far more reliably.
+HOLD_TIME_BY_TYPE = {
+    "SCALP": "5-30 min",
+    "INTRADAY": "30 min - 4h",
+    "SWING": "4-24h",
+}
+
+# ─── TP / R:R rules by trade type ─────────────────────────────
+# SCALPs need tight, nearby targets — chasing a 2.2:1 R:R on a 5-30min hold
+# pushes the TP out to distant HTF levels that rarely get hit in time.
+# Mirrors risk_manager.MIN_RR_BY_TYPE so the AI's targets actually pass
+# validate_trade() instead of getting rejected or producing unrealistic TPs.
+TP_RULES_TEXT = (
+    f"- TP: For SCALP, target the NEAREST meaningful level on the entry timeframe "
+    f"(S/R, EMA21, VWAP, swing high/low, POC) — R:R must be {MIN_RR_BY_TYPE['SCALP']}:1+ after fees "
+    f"(0.18% friction). For INTRADAY/SWING, target the next higher-TF S/R level — "
+    f"R:R must be {MIN_RR_BY_TYPE['INTRADAY']}:1+ after fees. "
+    f"Do NOT stretch a SCALP's TP out to a higher-TF level just to hit {MIN_RR_BY_TYPE['INTRADAY']}:1 — "
+    f"if the nearest level only gives {MIN_RR_BY_TYPE['SCALP']}:1-{MIN_RR_BY_TYPE['INTRADAY']}:1, that's a valid SCALP."
+)
 
 
 # ─── System Prompts ──────────────────────────────────────────
@@ -70,14 +97,23 @@ ANALYZE_SYSTEM = """You are an elite crypto futures trader with 15+ years experi
 - NEVER chase: Price must be at a key level (EMA pullback, VWAP, S/R zone).
 - Require 3+ confluences across timeframes.
 - SL: Place beyond structure on the ENTRY timeframe. Never at round numbers.
-- TP: Target next higher-TF S/R level. R:R must be 2.2:1+ after fees (0.18% friction).
-- Leverage: Max 12x. Scale: 7→5x, 8→8x, 9→10x, 10→12x.
+__TP_RULES__
+- Leverage: Max 25x. Scale: 7→5x, 8→8x, 9→15x, 10→25x.
 - Reject if: HTF trend conflicts, RSI extreme, overextended, chasing.
 
 **Direction rules:**
 - LONG / SHORT: Clear setup exists RIGHT NOW — price is at the entry level, take it.
 - WAIT: Trend/bias is clear BUT price is NOT yet at the entry level (e.g. needs to pull back to EMA, reach a resistance). Use this instead of NO_TRADE when the direction is known and you'd trade it — just not yet.
 - NO_TRADE: No clear bias, conflicting signals, or market is not worth trading at all.
+
+**Trader's Request:**
+You will be told the trader's available capital, preferred trading mode (SCALP/INTRADAY/SWING, or "ANY" to let you pick), preferred leverage (or "AI decides"), profit target, and max loss tolerance. Use this:
+- If a preferred mode is given, prioritize finding a valid setup of that type. If found, set "trade_type" to it.
+- If the preferred mode has NO valid setup but a different mode does, use that other mode for your main verdict instead and explain the substitution in "mode_note" (e.g. "No SCALP setup — 1h trend supports an INTRADAY short instead").
+- Optionally list other viable setups in different trade_types in "alternative_setups" — even if your main verdict already matches the preferred mode. Each entry: trade_type, direction, entry, stop_loss, take_profit, leverage, reason.
+- If profit target / max loss are given, prefer SL/TP placements that roughly fit them — but NEVER break the SL structure rules or the 2.2:1 R:R minimum just to hit a target.
+- If NO mode has a valid setup at all, return direction "NO_TRADE" and leave "mode_note" explaining why none of the requested (or any) modes work right now.
+- If no preferences are given, ignore this section and analyze normally.
 
 **Output ONLY valid JSON (no markdown, no code fences):**
 {
@@ -93,6 +129,8 @@ ANALYZE_SYSTEM = """You are an elite crypto futures trader with 15+ years experi
   "risk_score": "LOW" or "MEDIUM" or "HIGH",
   "wait_condition": "WAIT only: exact condition to watch e.g. 'Price pulls back to 15m EMA21 at $207.05'",
   "wait_direction": "WAIT only: the trade direction once condition is met — LONG or SHORT",
+  "mode_note": "empty string, or an explanation if the trader's requested mode wasn't usable / no trade is possible",
+  "alternative_setups": [optional, list of other viable setups: {"trade_type": "...", "direction": "LONG/SHORT", "entry": number, "stop_loss": number, "take_profit": number, "leverage": number, "reason": "..."}],
   "reasons": ["reason 1 (mention which TF)", "reason 2", ...],
   "advice": "One line of actionable advice"
 }"""
@@ -111,8 +149,8 @@ SCAN_SYSTEM = """You are an elite crypto futures trader. You receive multi-timef
 **Rules:**
 - 3+ confluences across timeframes required
 - Never chase — must be at a key level on the entry TF
-- R:R must be 2.2:1+ after fees (0.18% total friction)
-- Higher TF S/R levels are stronger — use them for TP targets
+__TP_RULES__
+- Higher TF S/R levels are stronger — use them for TP targets on INTRADAY/SWING
 - Max 3 picks, ranked by quality. Return [] if nothing is good.
 
 **Output ONLY valid JSON array (no markdown, no code fences):**
@@ -136,6 +174,11 @@ SCAN_SYSTEM = """You are an elite crypto futures trader. You receive multi-timef
 
 Return [] if no good setups exist."""
 
+# Substitute the per-trade-type TP/R:R rules into both prompts (kept out of
+# the f-string body since both prompts contain literal { } JSON braces).
+ANALYZE_SYSTEM = ANALYZE_SYSTEM.replace("__TP_RULES__", TP_RULES_TEXT)
+SCAN_SYSTEM = SCAN_SYSTEM.replace("__TP_RULES__", TP_RULES_TEXT)
+
 
 REANALYZE_SYSTEM = """You are an elite crypto futures trader managing an ALREADY-OPEN position. You receive fresh multi-timeframe technical data plus the current state of the trade. Your job is to reassess the trade against current market conditions and recommend any adjustment.
 
@@ -153,6 +196,12 @@ REANALYZE_SYSTEM = """You are an elite crypto futures trader managing an ALREADY
 - MOVE_BOTH: Both SL and TP need adjusting.
 - CLOSE_NOW: Only if the trend has clearly reversed against the position, or a major risk event/structure break is visible. Use HIGH urgency for this.
 - new_stop_loss / new_take_profit must be null unless the corresponding action is suggested.
+
+**Stop-hunt rule (critical):** new_stop_loss must be at least 0.3% away from the CURRENT PRICE
+(not just the entry price), placed beyond a real structure level (swing high/low, EMA, S/R zone).
+A stop sitting 1-2 candle wicks from current price will get hunted on noise — that defeats the
+purpose of "locking in profit". If no level beyond that 0.3% buffer justifies tightening yet,
+return action "HOLD" instead of MOVE_SL.
 
 **Output ONLY valid JSON (no markdown, no code fences):**
 {
@@ -229,20 +278,40 @@ def _build_tf_snapshot(df: pd.DataFrame, tf: str, full_detail: bool = False) -> 
     EMA 9: {ema9:.6f} | EMA 21: {ema21:.6f} | EMA 50: {ema50:.6f}
     Close: {close:.6f} | EMA cross up: {row.get('ema_cross_up', False)} | EMA cross down: {row.get('ema_cross_down', False)}"""
 
-    # S/R levels (important for all TFs)
+    # EMA 200 — long-term bias reference (HTF trend filter)
+    ema200 = row.get("ema_200", 0)
+    if ema200 and not pd.isna(ema200) and close > 0:
+        ema200_side = "ABOVE" if close > ema200 else "BELOW"
+        ema200_dist = (close - ema200) / ema200 * 100
+        snapshot += f"\n    EMA 200: {ema200:.6f} | Price {ema200_side} EMA200 ({ema200_dist:+.2f}%)"
+
+    # S/R levels (important for all TFs) — give explicit % distance so the
+    # AI doesn't have to compute it for SL/TP placement.
     support = row.get("nearest_support", "N/A")
     resistance = row.get("nearest_resistance", "N/A")
-    if support != "N/A" and not pd.isna(support):
-        snapshot += f"\n    Support: {support:.6f} (near: {row.get('near_support', False)}) | Resistance: {resistance:.6f} (near: {row.get('near_resistance', False)})"
+    if support != "N/A" and not pd.isna(support) and close > 0:
+        sup_dist = (close - support) / close * 100
+        res_dist = (resistance - close) / close * 100
+        snapshot += (
+            f"\n    Support: {support:.6f} ({sup_dist:.2f}% below, near: {row.get('near_support', False)})"
+            f" | Resistance: {resistance:.6f} ({res_dist:.2f}% above, near: {row.get('near_resistance', False)})"
+        )
+
+    # VWAP — key intraday structure level, shown on all TFs
+    vwap = row.get("vwap", 0)
+    if vwap and not pd.isna(vwap) and close > 0:
+        vwap_side = "ABOVE" if close > vwap else "BELOW"
+        vwap_dist = (close - vwap) / vwap * 100
+        snapshot += f"\n    VWAP: {vwap:.6f} | Price {vwap_side} VWAP ({vwap_dist:+.2f}%)"
+
+    # POC (volume profile point of control) — shown on all TFs
+    poc = row.get("poc_price", None)
+    if poc and not pd.isna(poc) and close > 0:
+        poc_dist = (close - poc) / poc * 100
+        snapshot += f"\n    POC: {poc:.6f} ({poc_dist:+.2f}% from price, at HVN: {row.get('high_volume_node', False)})"
 
     if not full_detail:
         return snapshot
-
-    # Full detail for entry timeframes
-    vwap = row.get("vwap", 0)
-    if vwap and not pd.isna(vwap):
-        vwap_side = "ABOVE" if close > vwap else "BELOW"
-        snapshot += f"\n    VWAP: {vwap:.6f} ({vwap_side})"
 
     # BB
     bb_upper = row.get("bb_upper", 0)
@@ -285,11 +354,6 @@ def _build_tf_snapshot(df: pd.DataFrame, tf: str, full_detail: bool = False) -> 
         snapshot += f"\n    Bull streak: {int(bull_streak)} candles"
     if bear_streak and not pd.isna(bear_streak) and bear_streak >= 3:
         snapshot += f"\n    Bear streak: {int(bear_streak)} candles"
-
-    # POC
-    poc = row.get("poc_price", None)
-    if poc and not pd.isna(poc):
-        snapshot += f"\n    POC: {poc:.6f} (at HVN: {row.get('high_volume_node', False)})"
 
     # Last 3 candles
     candles = []
@@ -344,7 +408,122 @@ def build_indicator_snapshot(tf_data: dict, symbol: str = "") -> str:
     return snapshot
 
 
+# ─── BTC market regime context (for altcoin correlation) ─────
+
+def build_btc_context(btc_tf_data: dict) -> str:
+    """
+    Build a short BTC trend/regime summary from 1h and 1d data, used as
+    backdrop context for altcoin analysis. Most alts correlate with BTC,
+    so a counter-trend altcoin trade against a strong BTC regime is riskier.
+
+    Args:
+        btc_tf_data: dict of {"1h": df, "1d": df} for BTC/USDT, with
+                     indicators already added.
+
+    Returns:
+        Formatted text block, or "" if no usable BTC data.
+    """
+    from indicators import add_higher_tf_indicators
+
+    lines = []
+    for tf in ["1d", "1h"]:
+        df = btc_tf_data.get(tf)
+        if df is None or len(df) < 20:
+            continue
+        info = add_higher_tf_indicators(df)
+        if not info.get("htf_valid"):
+            continue
+        rsi = info.get("htf_rsi", 50)
+        lines.append(f"  {tf}: {info['htf_trend']} (EMA21 {info['htf_ema_21']:.2f} vs EMA50 {info['htf_ema_50']:.2f}, RSI {rsi:.1f})")
+
+    if not lines:
+        return ""
+
+    return (
+        "BTC MARKET REGIME (context — most altcoins correlate with BTC):\n"
+        + "\n".join(lines)
+        + "\nWeigh this in your direction/confidence: a trade against BOTH BTC TFs' "
+        "trend is higher risk and should generally need stronger confluence or lower confidence."
+    )
+
+
 # ─── JSON parsers ────────────────────────────────────────────
+
+def _repair_truncated_json(text: str) -> str:
+    """Best-effort repair for a JSON object cut off mid-stream (hit max_tokens).
+
+    Trims back to the last complete "key": value pair and closes any
+    still-open braces/brackets, so we can recover early fields (direction,
+    entry, stop_loss, take_profit, leverage, ...) even if later fields
+    (reasons, advice, alternative_setups, ...) never arrived.
+    """
+    stack = []
+    in_string = False
+    escape = False
+    last_safe = -1
+    last_safe_stack = None
+
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        elif ch == "," and stack:
+            last_safe = i
+            last_safe_stack = list(stack)
+
+    if not stack or last_safe == -1 or last_safe_stack is None:
+        return text
+
+    closers = "".join("}" if c == "{" else "]" for c in reversed(last_safe_stack))
+    return text[:last_safe] + closers
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] — a common LLM JSON quirk that
+    leaves an otherwise-complete response with balanced brackets, which
+    _repair_truncated_json() can't fix since it only trims unbalanced text."""
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _load_json_lenient(clean: str) -> tuple:
+    """Parse JSON, retrying with trailing-comma cleanup and truncation repair.
+
+    Returns (data, repaired: bool). Raises json.JSONDecodeError if no
+    variant of the text can be parsed.
+    """
+    try:
+        return json.loads(clean), False
+    except json.JSONDecodeError:
+        pass
+
+    no_trailing = _strip_trailing_commas(clean)
+    if no_trailing != clean:
+        try:
+            return json.loads(no_trailing), False
+        except json.JSONDecodeError:
+            pass
+
+    repaired = _repair_truncated_json(clean)
+    if repaired != clean:
+        repaired = _strip_trailing_commas(repaired)
+        return json.loads(repaired), True
+
+    # Nothing recoverable — re-raise the original error.
+    return json.loads(clean), False
+
 
 def _parse_analysis_response(text: str) -> dict:
     """Parse AI analysis response (single coin)."""
@@ -361,7 +540,12 @@ def _parse_analysis_response(text: str) -> dict:
             if start >= 0 and end > start:
                 clean = clean[start:end]
 
-        data = json.loads(clean)
+        data, repaired = _load_json_lenient(clean)
+
+        trade_type = str(data.get("trade_type", "SCALP")).upper()
+        reasons = data.get("reasons", [])
+        if repaired:
+            reasons = list(reasons) + ["Note: AI response was truncated (hit token limit) — recovered partial verdict."]
 
         return {
             "direction": str(data.get("direction", "NO_TRADE")).upper(),
@@ -371,12 +555,14 @@ def _parse_analysis_response(text: str) -> dict:
             "take_profit": data.get("take_profit"),
             "leverage": int(data.get("leverage", 0)),
             "timeframe": str(data.get("timeframe", "5m")),
-            "trade_type": str(data.get("trade_type", "SCALP")).upper(),
-            "hold_time": str(data.get("hold_time", "15-30 min")),
+            "trade_type": trade_type,
+            "hold_time": HOLD_TIME_BY_TYPE.get(trade_type, str(data.get("hold_time", "15-30 min"))),
             "risk_score": str(data.get("risk_score", "UNKNOWN")).upper(),
             "wait_condition": str(data.get("wait_condition", "")),
             "wait_direction": str(data.get("wait_direction", "")).upper(),
-            "reasons": data.get("reasons", []),
+            "mode_note": str(data.get("mode_note", "")),
+            "alternative_setups": data.get("alternative_setups", []),
+            "reasons": reasons,
             "advice": str(data.get("advice", "")),
         }
 
@@ -394,6 +580,8 @@ def _parse_analysis_response(text: str) -> dict:
             "risk_score": "UNKNOWN",
             "wait_condition": "",
             "wait_direction": "",
+            "mode_note": "",
+            "alternative_setups": [],
             "reasons": [f"AI response parse error: {text[:150]}"],
             "advice": "",
         }
@@ -414,14 +602,18 @@ def _parse_reanalysis_response(text: str) -> dict:
             if start >= 0 and end > start:
                 clean = clean[start:end]
 
-        data = json.loads(clean)
+        data, repaired = _load_json_lenient(clean)
+
+        reasons = data.get("reasons", [])
+        if repaired:
+            reasons = list(reasons) + ["Note: AI response was truncated (hit token limit) — recovered partial verdict."]
 
         return {
             "action": str(data.get("action", "HOLD")).upper(),
             "new_stop_loss": data.get("new_stop_loss"),
             "new_take_profit": data.get("new_take_profit"),
             "urgency": str(data.get("urgency", "LOW")).upper(),
-            "reasons": data.get("reasons", []),
+            "reasons": reasons,
             "advice": str(data.get("advice", "")),
         }
 
@@ -457,12 +649,13 @@ def _parse_scan_response(text: str) -> list:
                 if start >= 0 and end > start:
                     clean = clean[start:end]
 
-        data = json.loads(clean)
+        data, _ = _load_json_lenient(clean)
         if not isinstance(data, list):
             data = [data]
 
         results = []
         for item in data:
+            trade_type = str(item.get("trade_type", "SCALP")).upper()
             results.append({
                 "symbol": str(item.get("symbol", "")),
                 "direction": str(item.get("direction", "NO_TRADE")).upper(),
@@ -472,8 +665,8 @@ def _parse_scan_response(text: str) -> list:
                 "take_profit": item.get("take_profit"),
                 "leverage": int(item.get("leverage", 0)),
                 "timeframe": str(item.get("timeframe", "5m")),
-                "trade_type": str(item.get("trade_type", "SCALP")).upper(),
-                "hold_time": str(item.get("hold_time", "15-30 min")),
+                "trade_type": trade_type,
+                "hold_time": HOLD_TIME_BY_TYPE.get(trade_type, str(item.get("hold_time", "15-30 min"))),
                 "risk_score": str(item.get("risk_score", "UNKNOWN")).upper(),
                 "reasons": item.get("reasons", []),
                 "advice": str(item.get("advice", "")),
@@ -486,8 +679,13 @@ def _parse_scan_response(text: str) -> list:
 
 # ─── AI Callers ──────────────────────────────────────────────
 
-def _call_gemini(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
-    """Call Gemini 2.5 Flash via Google AI Studio REST API."""
+def _call_gemini(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
+    """Call Gemini 2.5 Flash via Google AI Studio REST API.
+
+    json_mode is accepted for signature parity with the other providers but
+    has no effect — Gemini's responseMimeType="application/json" already
+    handles both JSON objects and arrays.
+    """
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         return {"error": "No GEMINI_API_KEY in .env", "skipped": True, "source": "gemini"}
@@ -501,7 +699,7 @@ def _call_gemini(prompt: str, system: str = None, max_tokens: int = 2048) -> dic
             {"parts": [{"text": full_prompt}]}
         ],
         "generationConfig": {
-            "temperature": 0.3,
+            "temperature": temperature,
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
             # Gemini 2.5 Flash reserves part of maxOutputTokens for internal
@@ -542,8 +740,13 @@ def _call_gemini(prompt: str, system: str = None, max_tokens: int = 2048) -> dic
         return {"error": str(e), "source": "gemini", "skipped": True}
 
 
-def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
-    """Call Llama 3.3 70B via Groq."""
+def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
+    """Call Llama 3.3 70B via Groq.
+
+    json_mode=True requests Groq's structured JSON object output mode —
+    only valid when the response schema is a JSON object (not an array,
+    e.g. NOT for SCAN_SYSTEM which returns a JSON array).
+    """
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
         return {"error": "No GROQ_API_KEY in .env", "skipped": True, "source": "groq"}
@@ -556,15 +759,18 @@ def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
     try:
         start = time.time()
         client = Groq(api_key=api_key)
-        chat = client.chat.completions.create(
+        kwargs = dict(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system or ANALYZE_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=max_tokens,
-            temperature=0.3,
+            temperature=temperature,
         )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        chat = client.chat.completions.create(**kwargs)
         elapsed = time.time() - start
 
         text = chat.choices[0].message.content
@@ -580,10 +786,14 @@ def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
         return {"error": str(e), "source": "groq", "skipped": True}
 
 
-def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
+def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
     """
     Call NVIDIA NIM via direct REST (no openai package needed).
     Tries llama-3.1-70b-instruct first (widely available), then deepseek-r1.
+
+    json_mode is accepted for signature parity but not sent — response_format
+    support varies across NIM-hosted models, and a 400 there would skip the
+    whole provider rather than just fall back to plain-text JSON parsing.
     """
     api_key = os.getenv("NVIDIA_API_KEY", "")
     if not api_key:
@@ -609,7 +819,7 @@ def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048) -> dic
             "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.3,
+            "temperature": temperature,
         }
         try:
             start = time.time()
@@ -645,7 +855,7 @@ def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048) -> dic
     return {"error": last_error or "All NVIDIA models failed", "source": "nvidia", "skipped": True}
 
 
-def _call_huggingface(prompt: str, system: str = None, max_tokens: int = 2048) -> dict:
+def _call_huggingface(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
     """Call Qwen2.5 72B via HuggingFace Serverless Inference API."""
     api_key = os.getenv("HF_API_KEY", "")
     if not api_key:
@@ -661,8 +871,10 @@ def _call_huggingface(prompt: str, system: str = None, max_tokens: int = 2048) -
             {"role": "user", "content": prompt},
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.3,
+        "temperature": temperature,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
 
     try:
         start = time.time()
@@ -811,7 +1023,7 @@ def _pick_providers(available: dict) -> list:
 
 # ─── Single coin: AI full analysis ──────────────────────────
 
-def analyze_coin_ai(symbol: str, tf_data: dict) -> dict:
+def analyze_coin_ai(symbol: str, tf_data: dict, user_prefs: dict = None, btc_context: str = None) -> dict:
     """
     Send multi-timeframe indicator data to AI for full trade analysis.
     AI decides: direction, confidence, entry, SL, TP, timeframe, trade type.
@@ -820,25 +1032,61 @@ def analyze_coin_ai(symbol: str, tf_data: dict) -> dict:
         symbol: coin symbol
         tf_data: dict of {timeframe: DataFrame} with indicators already added.
                  e.g. {"1m": df_1m, "3m": df_3m, "5m": df_5m, ...}
+        btc_context: optional pre-built BTC regime text from build_btc_context(),
+                 prepended to the prompt as backdrop for altcoin analysis.
+        user_prefs: optional dict with the trader's request for this analysis:
+                 {"capital": float, "mode": "SCALP"/"INTRADAY"/"SWING"/"ANY",
+                  "leverage": int or None, "profit_target": str or None,
+                  "max_loss": str or None}
 
     Returns:
         dict with: direction, confidence, entry, stop_loss, take_profit,
-                   leverage, timeframe, trade_type, hold_time, reasons,
-                   risk_score, advice, decided_by
+                   leverage, timeframe, trade_type, hold_time, mode_note,
+                   alternative_setups, reasons, risk_score, advice, decided_by
     """
 
     snapshot = build_indicator_snapshot(tf_data, symbol)
+
+    request_block = ""
+    if user_prefs:
+        mode = user_prefs.get("mode", "ANY")
+        mode_str = "Any — pick the best setup available" if mode == "ANY" else mode
+        lev = user_prefs.get("leverage")
+        lev_str = f"{lev}x" if lev else "AI decides based on confidence"
+        profit_str = user_prefs.get("profit_target") or "AI decides — best R:R available"
+        loss_str = user_prefs.get("max_loss") or "Standard risk management"
+        capital = user_prefs.get('capital', 0)
+        request_block = f"""
+TRADER'S REQUEST FOR THIS ANALYSIS:
+- Available capital: ${capital:,.2f}
+- Preferred trading mode: {mode_str}
+- Preferred leverage: {lev_str}
+- Profit target: {profit_str}
+- Max loss tolerance: {loss_str}
+
+Once you pick entry/SL/TP/leverage, work out the approximate $ risk and $ reward
+for ${capital:,.2f} capital at that leverage (position_size = capital * leverage;
+risk = position_size * SL distance %; reward = position_size * TP distance %).
+Use those dollar amounts — not just percentages — to judge whether the trade_type
+(SCALP/INTRADAY/SWING) and hold_time you picked actually make sense (e.g. a SCALP
+that nets less than ~$0.20 after friction on this capital is not worth it — prefer
+INTRADAY/SWING with a deeper target instead, or NO_TRADE if nothing clears friction).
+"""
+
+    confidence_stats_text = format_confidence_stats_text()
+    btc_block = f"\n{btc_context}\n" if btc_context else ""
 
     prompt = f"""Analyze this coin using multi-timeframe data below. Use top-down analysis:
 1. Start from 1D/1H to determine overall bias
 2. Use 15m/5m to find entry structure
 3. Use 3m/1m for precise entry timing
-
+{btc_block}
 {snapshot}
-
+{request_block}
+{confidence_stats_text}
 FRICTION: Total fees + slippage = 0.18% round-trip. Factor this into your R:R calculation.
 SL RULES: Place SL beyond structure (support/resistance/EMA). Min distance from entry: 0.30%.
-TP RULES: Must achieve 2.2:1 R:R AFTER friction.
+{TP_RULES_TEXT}
 TIMEFRAME: Pick the best entry timeframe and trade type (SCALP/INTRADAY/SWING).
 
 If no clear setup exists across ANY timeframe, return direction: "NO_TRADE" with confidence: 0.
@@ -884,7 +1132,7 @@ Output ONLY valid JSON as specified in your instructions."""
     # Call active providers in parallel
     results = {}
     with ThreadPoolExecutor(max_workers=len(active)) as pool:
-        fs = {pool.submit(fn, prompt, ANALYZE_SYSTEM, 4096): key
+        fs = {pool.submit(fn, prompt, ANALYZE_SYSTEM, 6144): key
               for key, _, _, fn in active}
         for future in as_completed(fs):
             key = fs[future]
@@ -902,7 +1150,7 @@ Output ONLY valid JSON as specified in your instructions."""
                 continue
             print(f"  {DIM}All active providers failed — falling back to {label}...{RESET}")
             try:
-                r = fn(prompt, ANALYZE_SYSTEM, 4096)
+                r = fn(prompt, ANALYZE_SYSTEM, 6144)
             except Exception as e:
                 r = {"error": str(e), "skipped": True, "source": key}
             results[key] = r
@@ -939,14 +1187,43 @@ Output ONLY valid JSON as specified in your instructions."""
     final = analyses[primary_key]
     final["decided_by"] = primary_label
 
-    # Note if secondary opinion differs
+    # ─── Ensemble agreement ──────────────────────────────────
+    # Two providers agreeing on direction is a stronger signal than one;
+    # disagreement should temper confidence/leverage rather than just be noted.
     if secondary_key:
         sec = analyses[secondary_key]
         sec_label = next(label for k, label, _, _ in _PROVIDERS if k == secondary_key)
-        if sec["direction"] != final["direction"]:
+
+        if sec["direction"] == final["direction"]:
+            # Agreement: average numeric SL/TP/entry/leverage from both providers
+            # for a less idiosyncratic, blended target.
+            if final["direction"] in ("LONG", "SHORT", "WAIT"):
+                numeric_fields = ["entry", "stop_loss", "take_profit"]
+                if all(final.get(f) is not None and sec.get(f) is not None for f in numeric_fields):
+                    for f in numeric_fields:
+                        final[f] = (final[f] + sec[f]) / 2
+            if final.get("leverage") and sec.get("leverage"):
+                final["leverage"] = round((final["leverage"] + sec["leverage"]) / 2)
+            final["reasons"].append(
+                f"Ensemble: {sec_label} agrees on {sec['direction']} (conf {sec['confidence']}) — "
+                f"SL/TP/leverage averaged across both providers"
+            )
+        else:
             final["reasons"].append(
                 f"Note: {sec_label} suggested {sec['direction']} (conf {sec['confidence']})"
             )
+            # Disagreement on an actionable trade — temper confidence/leverage
+            # rather than acting on the primary's full conviction alone.
+            if final["direction"] in ("LONG", "SHORT") and sec["direction"] != "NO_TRADE":
+                capped_conf = min(final["confidence"], 6)
+                capped_lev = min(final.get("leverage", 5), 5)
+                if capped_conf < final["confidence"] or capped_lev < final.get("leverage", 5):
+                    final["reasons"].append(
+                        f"Providers disagree on direction — confidence capped at {capped_conf}/10 "
+                        f"and leverage capped at {capped_lev}x"
+                    )
+                final["confidence"] = capped_conf
+                final["leverage"] = capped_lev
 
     # Display final verdict
     print(f"\n  {CYAN}{BOLD}{'─' * 55}{RESET}")
@@ -966,8 +1243,25 @@ Output ONLY valid JSON as specified in your instructions."""
         dir_color = GREEN if dir_str == "LONG" else RED
         print(f"  {dir_color}{BOLD}  AI VERDICT: {dir_str}{RESET} {DIM}| Confidence: {conf}/10 | Risk: {final.get('risk_score', '?')}{RESET}")
     print(f"  {DIM}  Decided by: {final['decided_by']}{RESET}")
+    if final.get("mode_note"):
+        print(f"  {YELLOW}  Note: {final['mode_note']}{RESET}")
     if final.get("advice"):
         print(f"  {CYAN}  Advice: {final['advice'][:150]}{RESET}")
+
+    # Other setups the AI considered (other trade types/modes)
+    alts = final.get("alternative_setups") or []
+    for alt in alts:
+        a_dir = str(alt.get("direction", "?")).upper()
+        a_type = str(alt.get("trade_type", "?")).upper()
+        a_color = GREEN if a_dir == "LONG" else RED
+        a_entry, a_sl, a_tp = alt.get("entry"), alt.get("stop_loss"), alt.get("take_profit")
+        line = f"  {DIM}  Also viable — {a_color}{a_type} {a_dir}{RESET}{DIM}"
+        if a_entry and a_sl and a_tp:
+            line += f": entry ${a_entry:,.6f} | SL ${a_sl:,.6f} | TP ${a_tp:,.6f} | {alt.get('leverage', '?')}x"
+        if alt.get("reason"):
+            line += f" — {alt['reason']}"
+        print(line + RESET)
+
     print(f"  {CYAN}{BOLD}{'=' * 55}{RESET}\n")
 
     logger.info(f"[AI Analysis] {symbol}: {dir_str} conf={conf} by {final['decided_by']}")
@@ -1187,8 +1481,8 @@ Use top-down analysis for each coin:
 
 FRICTION: Total fees + slippage = 0.18% round-trip.
 SL RULES: Place SL beyond structure. Min distance: 0.30%.
-TP RULES: Must achieve 2.2:1 R:R AFTER friction.
-LEVERAGE: Max 12x. Scale: conf 7→5x, 8→8x, 9→10x, 10→12x.
+{TP_RULES_TEXT}
+LEVERAGE: Max 25x. Scale: conf 7→5x, 8→8x, 9→15x, 10→25x.
 For each pick, specify timeframe, trade_type (SCALP/INTRADAY/SWING), and hold_time.
 
 If NO coins have a good setup, return an empty array [].
@@ -1227,7 +1521,7 @@ Output ONLY a valid JSON array as specified in your instructions."""
     # Call active providers in parallel
     raw_results = {}
     with ThreadPoolExecutor(max_workers=len(active)) as pool:
-        fs = {pool.submit(fn, prompt, SCAN_SYSTEM, 4096): key
+        fs = {pool.submit(fn, prompt, SCAN_SYSTEM, 6144, 0.15, False): key
               for key, _, _, fn in active}
         for future in as_completed(fs):
             key = fs[future]
@@ -1245,7 +1539,7 @@ Output ONLY a valid JSON array as specified in your instructions."""
                 continue
             print(f"  {DIM}All active providers failed — falling back to {label}...{RESET}")
             try:
-                r = fn(prompt, SCAN_SYSTEM, 4096)
+                r = fn(prompt, SCAN_SYSTEM, 6144, 0.15, False)
             except Exception as e:
                 r = {"error": str(e), "skipped": True, "source": key}
             raw_results[key] = r
@@ -1305,94 +1599,6 @@ Output ONLY a valid JSON array as specified in your instructions."""
     logger.info(f"[AI Scan] {n} picks from {len(candidates)} candidates (by {decided_by})")
 
     return final_picks
-
-
-# ─── Legacy verify_trade (kept for backward compatibility) ───
-
-def verify_trade(symbol: str, signal: dict, capital: float,
-                 leverage: int, balance: float) -> dict:
-    """
-    Legacy verification function. Now wraps analyze_coin_ai logic
-    but with the old return format for backward compatibility.
-    """
-    # Build a minimal prompt using the old format
-    reasons_text = "\n".join(f"  - {r}" for r in signal.get("reasons", []))
-    entry = signal.get("entry", 0)
-    sl = signal.get("stop_loss", 0)
-    tp = signal.get("take_profit", 0)
-
-    prompt = f"""Review this trade signal. Be VERY critical.
-
-TRADE: {signal.get('direction', 'N/A')} {symbol}
-  Entry: ${entry:,.6f} | SL: ${sl:,.6f} | TP: ${tp:,.6f}
-  Confidence: {signal.get('confidence', 0)}/10
-  Capital: ${capital:.2f} | Leverage: {leverage}x | Balance: ${balance:.2f}
-  HTF Trend: {signal.get('htf_trend', 'N/A')}
-
-ANALYSIS:
-{reasons_text}
-
-Output ONLY valid JSON with: verdict (APPROVED/REJECTED/NO_TRADE), reason, suggested_entry, suggested_sl, suggested_tp, suggested_leverage, risk_score, advice"""
-
-    old_system = """You are an elite crypto futures trader. Review the trade and output ONLY valid JSON:
-{
-  "verdict": "APPROVED" or "REJECTED" or "NO_TRADE",
-  "reason": "explanation",
-  "suggested_entry": number or null,
-  "suggested_sl": number or null,
-  "suggested_tp": number or null,
-  "suggested_leverage": number or null,
-  "risk_score": "LOW" or "MEDIUM" or "HIGH",
-  "advice": "actionable advice"
-}"""
-
-    gemini_result = _call_gemini(prompt, old_system)
-    groq_result = _call_groq(prompt, old_system)
-
-    # Parse old format
-    gem_ok = not gemini_result.get("skipped", True)
-    groq_ok = not groq_result.get("skipped", True)
-
-    def _parse_old(text):
-        try:
-            clean = text.strip()
-            if "```" in clean:
-                s = clean.find("{"); e = clean.rfind("}") + 1
-                clean = clean[s:e]
-            data = json.loads(clean)
-            return data
-        except Exception:
-            return {"verdict": "NO_TRADE", "reason": text[:150]}
-
-    gem_data = _parse_old(gemini_result.get("raw_text", "{}")) if gem_ok else {}
-    groq_data = _parse_old(groq_result.get("raw_text", "{}")) if groq_ok else {}
-
-    # Pick Gemini, fallback Groq
-    if gem_ok:
-        verdict_data = gem_data
-        decided_by = "Gemini 2.5 Flash"
-    elif groq_ok:
-        verdict_data = groq_data
-        decided_by = "Groq (fallback)"
-    else:
-        return {"approved": False, "reason": "Both AIs failed", "decided_by": "NONE", "suggestions": {}}
-
-    approved = str(verdict_data.get("verdict", "")).upper() == "APPROVED"
-    suggestions = {}
-    for k_old, k_new in [("suggested_entry", "entry"), ("suggested_sl", "sl"),
-                          ("suggested_tp", "tp"), ("suggested_leverage", "leverage")]:
-        if verdict_data.get(k_old):
-            suggestions[k_new] = verdict_data[k_old]
-    if verdict_data.get("advice"):
-        suggestions["advice"] = verdict_data["advice"]
-
-    return {
-        "approved": approved,
-        "final_verdict": str(verdict_data.get("verdict", "NO_TRADE")).upper(),
-        "decided_by": decided_by,
-        "reason": str(verdict_data.get("reason", "")),
-        "suggestions": suggestions,
-    }
 
 
 # ─── CLI test ────────────────────────────────────────────────

@@ -12,12 +12,16 @@ Features:
 - Prints live P&L updates and SL adjustments in terminal
 """
 
+import json
+import os
 import threading
 import time
 from datetime import datetime
 from logger_setup import get_logger
 
 logger = get_logger("monitor")
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 
 
 class C:
@@ -38,8 +42,9 @@ class PositionMonitor:
         self.pending = {}        # symbol -> pending limit order info
         self._running = False
         self._thread = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._last_print = {}  # symbol -> last printed SL (to avoid spam)
+        self._load_state()
 
     def add_position(self, symbol: str, direction: str, entry_price: float,
                      stop_loss: float, take_profit: float, quantity: float,
@@ -75,6 +80,7 @@ class PositionMonitor:
                 "total_distance": total_distance,
                 "opened_at": datetime.now().strftime("%H:%M:%S"),
                 "opened_ts": time.time(),   # For max hold time check
+                "last_reanalysis_ts": time.time(),  # Cooldown anchor for AI re-analysis SL/TP changes
                 "best_price": entry_price,
                 "sl_stage": "INITIAL",
                 "max_hold_seconds": 4 * 3600,  # 4 hours default
@@ -96,6 +102,7 @@ class PositionMonitor:
         print(f"    {C.DIM}66% to TP → SL trails tight (15% cushion){C.RESET}")
         print()
 
+        self._save_state()
         self._ensure_running()
         return True
 
@@ -151,6 +158,7 @@ class PositionMonitor:
         print(f"  {C.DIM}When filled → SL/TP placed automatically + trailing stop starts{C.RESET}\n")
         logger.info(f"[Monitor] Pending limit order {order_id} for {direction} {symbol} @ ${limit_price}")
 
+        self._save_state()
         self._ensure_running()
 
     def remove_position(self, symbol: str):
@@ -158,11 +166,73 @@ class PositionMonitor:
         with self._lock:
             self.tracked.pop(symbol, None)
             self._last_print.pop(symbol, None)
+        self._save_state()
 
     def get_tracked(self) -> dict:
         """Get all tracked positions with current SL stage."""
         with self._lock:
             return {k: dict(v) for k, v in self.tracked.items()}
+
+    def mark_reanalyzed(self, symbol: str):
+        """Record that an AI re-analysis SL/TP change was just applied —
+        anchors the re-analysis cooldown window."""
+        with self._lock:
+            if symbol in self.tracked:
+                self.tracked[symbol]["last_reanalysis_ts"] = time.time()
+        self._save_state()
+
+    def _load_state(self):
+        """Restore tracked/pending positions from disk so SL/TP survive a bot restart."""
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+
+            tracked = data.get("tracked", {})
+            pending = data.get("pending", {})
+
+            # Drop tracked entries whose position no longer exists on the exchange
+            open_symbols = None
+            try:
+                open_positions = self.executor.get_open_positions()
+                open_symbols = {
+                    p["symbol"].split(":")[0]: p.get("side")
+                    for p in open_positions if float(p.get("contracts", 0)) > 0
+                }
+            except Exception:
+                pass
+
+            restored = 0
+            for symbol, trade in tracked.items():
+                if open_symbols is not None:
+                    expected_side = "long" if trade.get("direction") == "LONG" else "short"
+                    if open_symbols.get(symbol) != expected_side:
+                        continue
+                self.tracked[symbol] = trade
+                restored += 1
+
+            self.pending = pending
+
+            if self.tracked or self.pending:
+                dropped = len(tracked) - restored
+                msg = f"[Monitor] Restored {restored} tracked position(s) from {STATE_FILE}"
+                if dropped:
+                    msg += f" ({dropped} stale entries dropped — position no longer open)"
+                logger.info(msg)
+                self._ensure_running()
+        except Exception as e:
+            logger.error(f"[Monitor] Failed to load state from {STATE_FILE}: {e}")
+
+    def _save_state(self):
+        """Persist tracked/pending positions to disk."""
+        try:
+            with self._lock:
+                data = {"tracked": self.tracked, "pending": self.pending}
+            with open(STATE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"[Monitor] Failed to save state to {STATE_FILE}: {e}")
 
     def update_levels(self, symbol: str, new_sl: float = None, new_tp: float = None) -> dict:
         """
@@ -226,6 +296,7 @@ class PositionMonitor:
             result["tp_updated"] = True
             result["new_tp"] = new_tp
 
+        self._save_state()
         logger.info(f"[Monitor] {symbol} levels manually updated via reanalysis: {result}")
         return result
 
@@ -312,6 +383,7 @@ class PositionMonitor:
             elif status == "canceled":
                 with self._lock:
                     self.pending.pop(symbol, None)
+                self._save_state()
                 sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
                 print(f"\n  {C.YELLOW}[Monitor] Pending order for {sym_short} was cancelled.{C.RESET}")
                 print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
@@ -478,6 +550,7 @@ class PositionMonitor:
                     self.tracked[symbol]["best_price"] = best
                     self.tracked[symbol]["sl_stage"] = new_stage
                     self.tracked[symbol]["sl_order_id"] = new_sl_order_id
+            self._save_state()
 
             # Calculate current P&L
             if direction == "LONG":

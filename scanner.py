@@ -3,7 +3,6 @@ Market scanner.
 Scans top Binance Futures gainers, filters, and ranks by strategy confidence.
 """
 
-import pandas as pd
 from tabulate import tabulate
 from fetch_data import fetch_ohlcv, get_top_gainers
 from indicators import add_all_indicators

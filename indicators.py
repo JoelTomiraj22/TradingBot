@@ -106,6 +106,48 @@ def add_higher_tf_indicators(df_htf: pd.DataFrame) -> dict:
     }
 
 
+def check_volatility_spike(df: pd.DataFrame, multiplier: float = 2.5) -> dict:
+    """
+    Detect an abnormal volatility spike on the most recent candle by comparing
+    its high-low range to the rolling ATR. Used as a proxy for "something just
+    happened" (news/liquidation cascade) when no news-calendar API is available.
+
+    Returns: {"spike": bool, "ratio": float}
+    """
+    if df is None or len(df) < 20:
+        return {"spike": False, "ratio": 0.0}
+
+    row = df.iloc[-1]
+    atr = row.get("atr", 0)
+    if atr is None or pd.isna(atr) or atr <= 0:
+        return {"spike": False, "ratio": 0.0}
+
+    candle_range = row["high"] - row["low"]
+    ratio = candle_range / atr
+
+    return {"spike": ratio >= multiplier, "ratio": round(ratio, 2)}
+
+
+def check_liquidity(df: pd.DataFrame, min_dollar_volume: float) -> dict:
+    """
+    Estimate average $ volume per candle from vol_sma_20 * close, used to
+    filter out illiquid coins before sending them to the AI / trading them.
+
+    Returns: {"liquid": bool, "dollar_volume": float}
+    """
+    if df is None or len(df) < 20:
+        return {"liquid": False, "dollar_volume": 0.0}
+
+    row = df.iloc[-1]
+    vol_sma = row.get("vol_sma_20", 0)
+    close = row.get("close", 0)
+    if vol_sma is None or pd.isna(vol_sma) or close <= 0:
+        return {"liquid": False, "dollar_volume": 0.0}
+
+    dollar_volume = vol_sma * close
+    return {"liquid": dollar_volume >= min_dollar_volume, "dollar_volume": round(dollar_volume, 2)}
+
+
 # ─── VWAP ──────────────────────────────────────────────────────
 
 def _calculate_vwap(df: pd.DataFrame) -> pd.Series:
@@ -301,7 +343,6 @@ def _add_pullback_detection(df: pd.DataFrame):
 
 if __name__ == "__main__":
     from fetch_data import fetch_ohlcv
-    from tabulate import tabulate
 
     df = fetch_ohlcv("BTC/USDT", "5m", 200)
     df = add_all_indicators(df)

@@ -19,18 +19,20 @@ from tabulate import tabulate
 
 from config import (
     get_exchange, print_config, DEFAULT_PAIR, DEFAULT_LEVERAGE,
-    SCAN_INTERVAL_MINUTES,
+    SCAN_INTERVAL_MINUTES, CAPITAL_PER_TRADE,
+    REANALYSIS_COOLDOWN_MINUTES, MIN_LEVEL_CHANGE_PCT,
+    MIN_DOLLAR_VOLUME, VOLATILITY_SPIKE_ATR_MULT, MAX_SCAN_CANDIDATES,
 )
 from fetch_data import fetch_ohlcv, get_current_price
-from strategy import evaluate_signal, evaluate_with_mtf
+from strategy import evaluate_signal
 from risk_manager import validate_trade, calculate_take_profit, MIN_RR_BY_TYPE
 from config import MIN_RR_RATIO
 from order_executor import OrderExecutor
 from scanner import scan_top_gainers, print_scan_results
 from trade_tracker import log_trade, print_stats, print_recent_trades
 from position_monitor import PositionMonitor
-from multi_ai_verifier import analyze_coin_ai, scan_coins_ai, build_indicator_snapshot, verify_trade, reanalyze_position_ai
-from indicators import add_all_indicators, add_higher_tf_indicators
+from multi_ai_verifier import analyze_coin_ai, scan_coins_ai, build_indicator_snapshot, reanalyze_position_ai, build_btc_context
+from indicators import add_all_indicators, check_liquidity, check_volatility_spike
 from logger_setup import get_logger
 
 logger = get_logger("bot")
@@ -283,6 +285,48 @@ def analyze_coin(symbol: str):
         price = get_current_price(symbol, exchange)
         print(f"Current Price: {C.bold(f'${price:,.4f}')}")
 
+        # ─── Tell the AI what you have and what you want ───────
+        balance = executor.get_total_balance()
+        print(f"\n{C.bold(C.cyan('Trade preferences'))} {C.dim(f'(Balance: ${balance:,.2f})')}")
+
+        cap_input = input(f"  Capital $ to use (Enter for ${CAPITAL_PER_TRADE:,.2f}): ").strip()
+        if cap_input:
+            try:
+                user_capital = float(cap_input)
+                if user_capital <= 0:
+                    raise ValueError
+            except ValueError:
+                print(C.red("Invalid amount."))
+                return
+        else:
+            user_capital = CAPITAL_PER_TRADE
+
+        mode_input = input(f"  Mode — scalp/intraday/swing (Enter = AI picks best): ").strip().upper()
+        mode_pref = mode_input if mode_input in ("SCALP", "INTRADAY", "SWING") else "ANY"
+
+        lev_input = input(f"  Preferred leverage 1-25 (Enter = AI decides): ").strip()
+        if lev_input:
+            try:
+                lev_pref = int(lev_input)
+                if not (1 <= lev_pref <= 25):
+                    raise ValueError
+            except ValueError:
+                print(C.red("Leverage must be 1-25."))
+                return
+        else:
+            lev_pref = None
+
+        profit_target = input(f"  Profit target $ or % (Enter = AI decides): ").strip()
+        max_loss = input(f"  Max loss you can take $ or % (Enter = standard risk mgmt): ").strip()
+
+        user_prefs = {
+            "capital": user_capital,
+            "mode": mode_pref,
+            "leverage": lev_pref,
+            "profit_target": profit_target or None,
+            "max_loss": max_loss or None,
+        }
+
         # Fetch ALL timeframes and compute indicators
         from multi_ai_verifier import ALL_TIMEFRAMES
         tf_data = {}
@@ -300,8 +344,20 @@ def analyze_coin(symbol: str):
             print(f"{C.red('Failed to fetch any timeframe data.')}")
             return
 
+        # ─── BTC market regime context (skip if analyzing BTC itself) ──
+        btc_context = None
+        if symbol != "BTC/USDT":
+            try:
+                btc_tf_data = {}
+                for tf in ["1h", "1d"]:
+                    df_btc = fetch_ohlcv("BTC/USDT", tf, 100, exchange)
+                    btc_tf_data[tf] = add_all_indicators(df_btc)
+                btc_context = build_btc_context(btc_tf_data)
+            except Exception as e:
+                print(f"  {C.dim(f'(BTC regime context unavailable: {e})')}")
+
         # ─── AI ANALYSIS — AI makes ALL trade decisions ────────
-        ai_signal = analyze_coin_ai(symbol, tf_data)
+        ai_signal = analyze_coin_ai(symbol, tf_data, user_prefs=user_prefs, btc_context=btc_context)
 
         direction = ai_signal.get("direction", "NO_TRADE")
         confidence = ai_signal.get("confidence", 0)
@@ -330,35 +386,12 @@ def analyze_coin(symbol: str):
 
             # Offer to place a limit order at the AI's target entry
             if entry and sl and tp and monitor:
-                balance = executor.get_total_balance()
+                user_leverage = lev_pref if lev_pref else min(ai_lev, 25)
                 print(f"\n  {C.cyan(C.bold('Place limit order at AI target entry?'))}")
                 print(f"  {C.dim('When filled, SL/TP + trailing stop activate automatically.')}")
-                print(f"  {C.dim(f'Balance: ${balance:,.2f} | AI suggests {ai_lev}x leverage')}")
-                raw = input(f"  Capital $ to use (or 'no' to skip): ").strip()
-                if raw.lower() in ("no", "n", ""):
-                    return
-
-                # Accept a plain number as capital amount (shortcut — no separate yes/no step)
-                try:
-                    user_capital = float(raw)
-                except ValueError:
-                    print(C.red("Invalid amount. Skipped."))
-                    return
-                if user_capital <= 0:
-                    print(C.red("Capital must be > 0. Skipped."))
-                    return
-
-                lev_input = input(f"  Leverage (Enter for {ai_lev}x, max 12): ").strip()
-                if not lev_input:
-                    user_leverage = min(ai_lev, 12)
-                else:
-                    try:
-                        user_leverage = int(lev_input)
-                    except ValueError:
-                        print(C.red("Invalid leverage. Skipped."))
-                        return
-                if user_leverage <= 0 or user_leverage > 12:
-                    print(C.red("Leverage must be 1-12. Skipped."))
+                print(f"  {C.dim(f'Capital: ${user_capital:,.2f} | Leverage: {user_leverage}x')}")
+                confirm = input(f"  Place limit order? (yes/no): ").strip().lower()
+                if confirm not in ("yes", "y"):
                     return
 
                 position_size = user_capital * user_leverage
@@ -401,6 +434,20 @@ def analyze_coin(symbol: str):
         if hold_time:
             print(f"  {C.dim(f'Expected hold: {hold_time}')}")
 
+        # Volatility-spike guard — recent candle range vs ATR (proxy for news/liquidation event)
+        spike_df = tf_data.get(ai_timeframe)
+        if spike_df is None:
+            spike_df = tf_data.get("5m")
+        vol_spike = check_volatility_spike(spike_df, VOLATILITY_SPIKE_ATR_MULT)
+        if vol_spike["spike"]:
+            ratio = vol_spike["ratio"]
+            print(f"\n  {C.red(C.bold(f'⚠  VOLATILITY SPIKE — last {ai_timeframe} candle is {ratio}x ATR'))}")
+            print(f"  {C.dim('Possible news/liquidation event. SL/TP may be unreliable.')}")
+            spike_confirm = input(f"\n{C.bold('Continue anyway? (yes/no):')} ").strip().lower()
+            if spike_confirm not in ("yes", "y"):
+                print(C.yellow("Trade cancelled."))
+                return
+
         entry = ai_signal.get("entry") or price
         sl = ai_signal.get("stop_loss")
         tp = ai_signal.get("take_profit")
@@ -432,38 +479,48 @@ def analyze_coin(symbol: str):
                 tp_pct = tp_dist / entry * 100
                 print(f"  {C.yellow('To pass:')} TP must be ${required_tp:,.6f} ({tp_pct:.2f}% from entry) for {needed_rr:.1f}:1 R:R")
                 print(f"  {C.dim('AI set TP at')} ${tp:,.6f} — {C.dim('too close to entry. Wait for a deeper target level.')}")
-            return
+
+                override = input(f"\n  {C.yellow('Override and proceed with the AI TP anyway? (yes/no):')} ").strip().lower()
+                if override not in ("yes", "y"):
+                    print(C.yellow("Trade cancelled."))
+                    return
+
+                validation = validate_trade(
+                    account_balance=balance,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    confidence=confidence,
+                    direction=direction,
+                    trade_type=trade_type,
+                    allow_low_rr=True,
+                )
+                if not validation["approved"]:
+                    print(f"{C.red('Trade REJECTED by risk manager')}: {C.red(validation['reason'])}")
+                    return
+                rr = validation["rr_ratio"]
+                print(f"  {C.yellow(C.bold(f'Manual override — proceeding at {rr:.2f}:1 R:R'))}")
+            else:
+                return
+
+        # ─── Correlation check — warn on stacking same-direction risk ──
+        if monitor:
+            same_direction = [
+                s for s, t in monitor.get_tracked().items()
+                if t.get("direction") == direction and s != symbol
+            ]
+            if len(same_direction) >= 2:
+                names = ", ".join(s.replace("/USDT", "") for s in same_direction)
+                print(f"\n  {C.yellow(C.bold('CORRELATION WARNING'))}")
+                print(f"  {C.yellow(f'Already {len(same_direction)} other {direction} positions open: {names}')}")
+                print(f"  {C.dim('Altcoins tend to move together with BTC — stacking same-direction')}")
+                print(f"  {C.dim('positions multiplies your exposure to a single market move.')}")
 
         # ─── STEP 1: Capital & Leverage ────────────────────────
         ai_lev = ai_signal.get("leverage", 5)
-        print(f"\n{C.bold(C.cyan('Set your trade size'))}")
-        print(f"  {C.dim(f'Balance: ${balance:,.2f} | AI suggests {ai_lev}x leverage')}")
-
-        cap_input = input(f"  Capital $ (required): ").strip()
-        if not cap_input:
-            print(C.yellow("No capital entered. Trade cancelled."))
-            return
-        try:
-            user_capital = float(cap_input)
-        except ValueError:
-            print(C.red("Invalid amount. Trade cancelled."))
-            return
-        if user_capital <= 0:
-            print(C.red("Capital must be > 0. Trade cancelled."))
-            return
-
-        lev_input = input(f"  Leverage (Enter for {ai_lev}x, max 12): ").strip()
-        if not lev_input:
-            user_leverage = min(ai_lev, 12)
-        else:
-            try:
-                user_leverage = int(lev_input)
-            except ValueError:
-                print(C.red("Invalid leverage. Trade cancelled."))
-                return
-        if user_leverage <= 0 or user_leverage > 12:
-            print(C.red("Leverage must be 1-12. Trade cancelled."))
-            return
+        user_leverage = lev_pref if lev_pref else min(ai_lev, 25)
+        print(f"\n{C.bold(C.cyan('Your setup'))}")
+        print(f"  {C.dim(f'Capital: ${user_capital:,.2f} | Leverage: {user_leverage}x (AI suggested {ai_lev}x)')}")
 
         # Recalculate with user's values
         position_size = user_capital * user_leverage
@@ -754,10 +811,38 @@ def reanalyze_position(symbol: str):
                 print(C.yellow("Position kept open."))
             return
 
-        # MOVE_SL / MOVE_TP / MOVE_BOTH
-        changes = []
+        # ─── Reanalysis cooldown (anti-whipsaw) ────────────────
+        last_reanalysis_ts = trade.get("last_reanalysis_ts", trade.get("opened_ts", time.time()))
+        cooldown_secs = REANALYSIS_COOLDOWN_MINUTES * 60
+        elapsed_since = time.time() - last_reanalysis_ts
+        if elapsed_since < cooldown_secs:
+            remaining_min = int((cooldown_secs - elapsed_since) // 60) + 1
+            print(f"\n  {C.yellow(C.bold('REANALYSIS COOLDOWN ACTIVE'))}")
+            print(f"  {C.dim(f'Last SL/TP change was {int(elapsed_since // 60)}m ago — wait {remaining_min}m more before applying another move.')}")
+            print(f"  {C.dim('(AI suggestion above is for reference only — not applied.)')}")
+            return
+
+        # ─── Minimum meaningful-change threshold (anti-whipsaw) ─
         if action in ("MOVE_SL", "MOVE_BOTH") and new_sl:
-            changes.append(f"  SL: ${trade['stop_loss']:,.6f} -> {C.cyan(f'${new_sl:,.6f}')}")
+            if abs(new_sl - trade["stop_loss"]) / price * 100 < MIN_LEVEL_CHANGE_PCT:
+                new_sl = None
+        if action in ("MOVE_TP", "MOVE_BOTH") and new_tp:
+            if abs(new_tp - trade["take_profit"]) / price * 100 < MIN_LEVEL_CHANGE_PCT:
+                new_tp = None
+        if not new_sl and not new_tp:
+            print(C.yellow(f"AI suggested a change smaller than the {MIN_LEVEL_CHANGE_PCT}% minimum — treating as HOLD."))
+            return
+
+        # MOVE_SL / MOVE_TP / MOVE_BOTH
+        MIN_SL_GAP_PCT = 0.3  # below this, the new SL sits within 1-2 candle wicks — stop-hunt risk
+
+        changes = []
+        sl_warning = False
+        if action in ("MOVE_SL", "MOVE_BOTH") and new_sl:
+            gap_pct = abs(new_sl - price) / price * 100
+            changes.append(f"  SL: ${trade['stop_loss']:,.6f} -> {C.cyan(f'${new_sl:,.6f}')} {C.dim(f'(gap from current price: {gap_pct:.2f}%)')}")
+            if gap_pct < MIN_SL_GAP_PCT:
+                sl_warning = True
         if action in ("MOVE_TP", "MOVE_BOTH") and new_tp:
             changes.append(f"  TP: ${trade['take_profit']:,.6f} -> {C.cyan(f'${new_tp:,.6f}')}")
 
@@ -768,6 +853,10 @@ def reanalyze_position(symbol: str):
         print(f"\n{C.bold('Suggested changes:')}")
         for c in changes:
             print(c)
+
+        if sl_warning:
+            print(f"\n  {C.red(C.bold('WARNING:'))} {C.red(f'New SL is within {MIN_SL_GAP_PCT}% of current price')} {C.dim(f'(${price:,.6f})')}")
+            print(f"  {C.red('— a normal wick could trigger it. Consider rejecting or adjusting manually.')}")
 
         confirm = input(f"\n{C.cyan(C.bold('Apply these changes to the live trade? (yes/no):'))} ").strip().lower()
         if confirm not in ("yes", "y"):
@@ -786,6 +875,9 @@ def reanalyze_position(symbol: str):
             print(f"  {C.green('SL updated to')} ${result['new_sl']:,.6f}")
         if result.get("tp_updated"):
             print(f"  {C.green('TP updated to')} ${result['new_tp']:,.6f}")
+
+        if result.get("sl_updated") or result.get("tp_updated"):
+            monitor.mark_reanalyzed(symbol)
 
         logger.info(f"Position {symbol} levels updated via reanalyze: {result}")
 
@@ -838,6 +930,20 @@ def scan_all_coins():
 
             row = df.iloc[-1]
 
+            # Liquidity filter — skip thin coins before spending AI budget on them
+            liquidity = check_liquidity(df, MIN_DOLLAR_VOLUME)
+            if not liquidity["liquid"]:
+                dv = liquidity["dollar_volume"]
+                print(f" {C.dim(f'illiquid (~${dv:,.0f}/candle)')}")
+                continue
+
+            # Volatility-spike guard — skip coins mid-spike (proxy for news/liquidation event)
+            vol_spike = check_volatility_spike(df, VOLATILITY_SPIKE_ATR_MULT)
+            if vol_spike["spike"]:
+                ratio = vol_spike["ratio"]
+                print(f" {C.dim(f'volatility spike ({ratio}x ATR)')}")
+                continue
+
             # Basic pre-filter: must have trend + volume + not overextended
             has_trend = (row["ema_9"] != row["ema_21"])  # EMAs not equal
             has_volume = row["vol_sma_20"] > 0 and row["volume"] > 0.5 * row["vol_sma_20"]
@@ -849,7 +955,10 @@ def scan_all_coins():
                 continue
 
             trend_dir = "BULL" if row["ema_9"] > row["ema_21"] else "BEAR"
-            pre_filtered.append({"symbol": symbol, "trend": trend_dir})
+            pre_filtered.append({
+                "symbol": symbol, "trend": trend_dir,
+                "dollar_volume": liquidity["dollar_volume"],
+            })
             print(f" {C.yellow(f'candidate ({trend_dir})')}")
 
         except Exception as e:
@@ -863,6 +972,13 @@ def scan_all_coins():
         print(f"  {C.dim('All coins filtered out. No clear trends or volume.')}")
         logger.info("allCoins scan — no candidates passed pre-filter")
         return
+
+    # Cap the AI batch size — rank by liquidity so the busiest coins win,
+    # bounding both the scan prompt size and the multi-TF fetch below.
+    if len(pre_filtered) > MAX_SCAN_CANDIDATES:
+        pre_filtered.sort(key=lambda x: x["dollar_volume"], reverse=True)
+        print(f"{C.dim(f'Capping to top {MAX_SCAN_CANDIDATES} by liquidity (of {len(pre_filtered)})')}")
+        pre_filtered = pre_filtered[:MAX_SCAN_CANDIDATES]
 
     # Phase 1.5: Fetch all TFs for candidates only
     print(f"\n{C.dim('Fetching multi-timeframe data for candidates...')}")
@@ -1011,7 +1127,37 @@ def run_scanner():
 
         if not validation["approved"]:
             print(f"  {C.red('REJECTED')}: {C.red(validation['reason'])}")
-            continue
+            if "R:R" in validation["reason"]:
+                tt = r.get("trade_type", "SCALP")
+                required_tp = calculate_take_profit(r["entry"], r["stop_loss"], r["signal"], MIN_RR_BY_TYPE.get(tt, MIN_RR_RATIO))
+                sl_dist = abs(r["entry"] - r["stop_loss"])
+                tp_dist = abs(required_tp - r["entry"])
+                needed_rr = tp_dist / sl_dist if sl_dist > 0 else 0
+                tp_pct = tp_dist / r["entry"] * 100
+                print(f"  {C.yellow('To pass:')} TP must be ${required_tp:,.6f} ({tp_pct:.2f}% from entry) for {needed_rr:.1f}:1 R:R")
+
+                override = input(f"  {C.yellow(f'Override and proceed with the AI TP for {symbol} anyway? (yes/no):')} ").strip().lower()
+                if override not in ("yes", "y"):
+                    print(C.yellow("Skipped."))
+                    continue
+
+                validation = validate_trade(
+                    account_balance=balance,
+                    entry_price=r["entry"],
+                    stop_loss=r["stop_loss"],
+                    take_profit=r["take_profit"],
+                    confidence=r["confidence"],
+                    direction=r["signal"],
+                    trade_type=tt,
+                    allow_low_rr=True,
+                )
+                if not validation["approved"]:
+                    print(f"  {C.red('REJECTED')}: {C.red(validation['reason'])}")
+                    continue
+                rr = validation["rr_ratio"]
+                print(f"  {C.yellow(C.bold(f'Manual override — proceeding at {rr:.2f}:1 R:R'))}")
+            else:
+                continue
 
         # Build signal_data dict for display
         signal_data = {

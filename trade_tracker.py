@@ -111,6 +111,54 @@ def get_stats() -> dict:
     }
 
 
+def get_confidence_stats(min_trades: int = 1) -> list:
+    """
+    Win rate broken down by AI confidence score, used to calibrate the AI's
+    confidence against its actual track record.
+
+    Returns a list of dicts (sorted by confidence desc), one per confidence
+    score that has at least `min_trades` recorded trades:
+        {"confidence": int, "trades": int, "wins": int, "win_rate": float}
+    """
+    df = get_trades()
+    if df.empty or "confidence" not in df.columns:
+        return []
+
+    stats = []
+    for conf, group in df.groupby("confidence"):
+        total = len(group)
+        if total < min_trades:
+            continue
+        wins = len(group[group["result"] == "WIN"])
+        stats.append({
+            "confidence": int(conf),
+            "trades": total,
+            "wins": wins,
+            "win_rate": round(wins / total * 100, 1),
+        })
+
+    stats.sort(key=lambda x: x["confidence"], reverse=True)
+    return stats
+
+
+def format_confidence_stats_text() -> str:
+    """
+    Render get_confidence_stats() as a short block of text for the AI prompt.
+    Returns "" if there isn't enough trade history to be useful yet.
+    """
+    stats = get_confidence_stats()
+    if not stats:
+        return ""
+
+    lines = [f"  Confidence {s['confidence']}/10: {s['wins']}/{s['trades']} wins ({s['win_rate']}%)" for s in stats]
+    return (
+        "HISTORICAL PERFORMANCE BY CONFIDENCE (this account's actual results):\n"
+        + "\n".join(lines)
+        + "\nIf a confidence level has a poor track record here, be more conservative "
+        "when assigning that confidence again — calibrate against reality, not just the setup."
+    )
+
+
 def print_stats():
     """Print a summary of trading stats."""
     stats = get_stats()

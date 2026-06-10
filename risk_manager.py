@@ -11,7 +11,7 @@ TRADING_FEE_PCT = 0.0004        # 0.04% per side (maker), 0.04% round trip = 0.0
 ROUND_TRIP_FEE_PCT = 0.0008     # Total fees for entry + exit
 SLIPPAGE_PCT = 0.0010           # 0.10% estimated slippage (entry + exit combined)
 TOTAL_COST_PCT = ROUND_TRIP_FEE_PCT + SLIPPAGE_PCT  # ~0.18% total friction
-MAX_LEVERAGE = 12               # Hard cap — conservative until strategy is proven profitable
+MAX_LEVERAGE = 25               # Hard cap
 MAX_CONCURRENT_RISK_PCT = 0.06  # Max 6% of account at risk across all positions
 MAX_HOLD_HOURS = 4              # Max hold time for scalp trades (hours)
 MAX_DAILY_LOSS_PCT = 0.05       # 5% max daily drawdown — stop trading for the day
@@ -91,14 +91,6 @@ def calculate_position_size(account_balance: float, entry_price: float,
     }
 
 
-def calculate_stop_loss(entry_price: float, atr: float, direction: str) -> float:
-    """Calculate stop loss using 1.5x ATR (wider for safety)."""
-    if direction == "LONG":
-        return entry_price - (1.5 * atr)
-    else:
-        return entry_price + (1.5 * atr)
-
-
 def calculate_take_profit(entry_price: float, stop_loss: float,
                           direction: str, rr_ratio: float = None) -> float:
     """Calculate take profit at minimum 2:1 R:R."""
@@ -122,13 +114,13 @@ def calculate_breakeven(entry_price: float, direction: str) -> float:
 
 def get_leverage_for_confidence(confidence: int) -> int:
     """
-    Map confidence score to leverage. CAPPED at 12x until strategy is proven.
+    Map confidence score to leverage. CAPPED at 25x.
 
     1-6:  Don't trade (0) — raised minimum to 7
     7:    5x  (conservative entry)
     8:    8x  (moderate)
-    9:    10x
-    10:   12x (hard cap)
+    9:    15x
+    10:   25x (hard cap)
     """
     if confidence <= 6:
         return 0
@@ -137,9 +129,9 @@ def get_leverage_for_confidence(confidence: int) -> int:
     elif confidence == 8:
         return 8
     elif confidence == 9:
-        return 10
+        return 15
     else:  # 10
-        return min(12, MAX_LEVERAGE)
+        return min(25, MAX_LEVERAGE)
 
 
 def calculate_expected_pnl(entry_price: float, stop_loss: float,
@@ -174,8 +166,13 @@ def calculate_expected_pnl(entry_price: float, stop_loss: float,
 def validate_trade(account_balance: float, entry_price: float,
                    stop_loss: float, take_profit: float,
                    confidence: int, direction: str,
-                   trade_type: str = "SCALP") -> dict:
-    """Full trade validation with leverage-aware risk and fee calculation."""
+                   trade_type: str = "SCALP",
+                   allow_low_rr: bool = False) -> dict:
+    """Full trade validation with leverage-aware risk and fee calculation.
+
+    allow_low_rr: skip the minimum R:R check (manual user override after
+    being shown the rejection — other checks still apply).
+    """
     min_rr = MIN_RR_BY_TYPE.get(trade_type, MIN_RR_RATIO)
     # Check confidence
     leverage = get_leverage_for_confidence(confidence)
@@ -192,7 +189,7 @@ def validate_trade(account_balance: float, entry_price: float,
         return {"approved": False, "reason": "Stop distance is zero"}
 
     rr_raw = tp_dist / stop_dist
-    if rr_raw < 1.5:
+    if rr_raw < 1.5 and not allow_low_rr:
         return {"approved": False, "reason": f"Raw R:R {rr_raw:.2f} is too low (need 1.5+ raw)"}
 
     # Check stop is not too tight — friction (0.18%) must be < 60% of SL distance
@@ -211,7 +208,7 @@ def validate_trade(account_balance: float, entry_price: float,
                                  pos["quantity"], direction, pos["position_size"])
 
     # Reject if after-fees R:R is below minimum (lower bar for SCALP — tighter targets)
-    if pnl["rr_ratio"] < min_rr:
+    if pnl["rr_ratio"] < min_rr and not allow_low_rr:
         return {
             "approved": False,
             "reason": f"R:R after fees+slippage is {pnl['rr_ratio']:.2f}:1 — need {min_rr}:1+ for {trade_type}. "
@@ -219,7 +216,7 @@ def validate_trade(account_balance: float, entry_price: float,
         }
 
     # Reject if fees eat too much of the profit
-    if pnl["fees"] > pnl["expected_profit"] * 0.3:
+    if pnl["fees"] > pnl["expected_profit"] * 0.3 and not allow_low_rr:
         return {"approved": False, "reason": f"Fees+slippage (${pnl['fees']:.2f}) eat >30% of profit — target too small"}
 
     breakeven = calculate_breakeven(entry_price, direction)

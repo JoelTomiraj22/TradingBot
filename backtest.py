@@ -3,7 +3,6 @@ Strategy backtester.
 Runs the strategy on historical data candle-by-candle, simulating trades.
 """
 
-import pandas as pd
 from tabulate import tabulate
 from fetch_data import fetch_ohlcv
 from indicators import add_all_indicators

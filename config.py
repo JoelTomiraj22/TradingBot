@@ -29,6 +29,22 @@ MIN_RR_RATIO = 2.2             # Minimum reward:risk ratio (after fees + slippag
 CAPITAL_PER_TRADE = 10.0       # $8–$10 per trade
 SCAN_INTERVAL_MINUTES = 15     # Scanner runs every 15 min
 
+# ─── Re-analysis whipsaw guard ──────────────────────────────────
+REANALYSIS_COOLDOWN_MINUTES = 10   # Min time between applied SL/TP changes per position
+MIN_LEVEL_CHANGE_PCT = 0.10        # Ignore SL/TP "moves" smaller than this % of price
+
+# ─── Scanner liquidity filter ───────────────────────────────────
+MIN_DOLLAR_VOLUME = 50_000     # Min avg $ volume per 5m candle (~ $14M/day) to consider a coin
+
+# ─── Scanner AI batch size cap ──────────────────────────────────
+# Caps how many pre-filtered coins get a full multi-TF fetch + sent to the
+# AI in one scan prompt, ranked by liquidity. Keeps the scan prompt (and
+# exchange API load) bounded regardless of how many coins pass pre-filter.
+MAX_SCAN_CANDIDATES = 12
+
+# ─── Volatility-spike guard ─────────────────────────────────────
+VOLATILITY_SPIKE_ATR_MULT = 2.5   # Last candle range > this x ATR = volatility spike
+
 # ─── Exchange Connection ────────────────────────────────────────
 def get_exchange():
     """Create and return a ccxt Binance USD-M Futures exchange instance."""

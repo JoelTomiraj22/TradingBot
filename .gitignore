@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 logs/
 trades.csv
+monitor_state.json
 .venv/
 venv/
 *.egg-info/

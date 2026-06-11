@@ -5,12 +5,15 @@ Complete all items before switching from testnet to live trading.
 ## Pre-Live Verification
 
 - [ ] Tested on testnet for at least 1 week
-- [ ] Win rate > 50% on backtest (run: `python backtest.py`)
+- [ ] Profit factor > 1.3 and win rate > 50% on backtest (run: `python backtest.py`)
 - [ ] All API permissions correct (futures enabled, withdrawal DISABLED)
 - [ ] Stop loss and take profit orders confirmed working on testnet
+      (note: demo mode uses the software monitor — verify exchange SL/TP appear once live)
 - [ ] Logging captures everything (check `logs/` folder)
-- [ ] Position sizing never exceeds 2% risk (verify in risk_manager.py tests)
+- [ ] Position sizing never exceeds 2% risk (run: `python risk_manager.py`)
 - [ ] Emergency close function tested (`closeall` command in bot)
+- [ ] Circuit breaker verified: after 3 losses, new entries are blocked until `reset`
+- [ ] At least one AI provider key set and reachable (shown at start of `analyze`)
 - [ ] `.env` has live keys populated
 - [ ] `USE_TESTNET` set to `False` in `.env`
 - [ ] Start with minimum capital ($8–$10 per trade)

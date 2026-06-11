@@ -5,7 +5,7 @@ pullback entries, and volume profile — never chases price.
 """
 
 import pandas as pd
-from indicators import add_all_indicators, add_higher_tf_indicators
+from indicators import add_all_indicators, add_higher_tf_indicators, detect_setups
 from fetch_data import fetch_ohlcv
 
 
@@ -38,9 +38,12 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
     if rejection:
         return rejection
 
+    # ─── SETUP DETECTION (pattern playbook) ───────────────────
+    setups = detect_setups(df)
+
     # ─── SCORE LONG AND SHORT ─────────────────────────────────
-    long_score, long_reasons = _check_long(row, prev, htf_data)
-    short_score, short_reasons = _check_short(row, prev, htf_data)
+    long_score, long_reasons = _check_long(row, prev, htf_data, setups)
+    short_score, short_reasons = _check_short(row, prev, htf_data, setups)
 
     # Pick the stronger signal
     if long_score >= short_score and long_score > 0:
@@ -67,8 +70,9 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
     has_mtf = any("aligned" in r.lower() for r in reasons)
     has_vwap = any("VWAP" in r for r in reasons if "WARNING" not in r)
     has_sr = any("support" in r.lower() or "resistance" in r.lower() for r in reasons if "WARNING" not in r)
+    has_setup = any(("S-TIER" in r or "A-TIER" in r) for r in reasons if "WARNING" not in r)
 
-    quality_checks = sum([has_candle, has_pullback, has_mtf, has_vwap, has_sr])
+    quality_checks = sum([has_candle, has_pullback, has_mtf, has_vwap, has_sr, has_setup])
     if quality_checks < 3:
         missing = []
         if not has_candle:
@@ -100,13 +104,15 @@ def evaluate_signal(df: pd.DataFrame, htf_data: dict = None) -> dict:
         stop_loss = entry + (sl_mult * atr)
         take_profit = entry - (tp_mult * atr)
 
-    breakeven = entry * 1.0018  # fees + slippage
+    # Breakeven includes fees + slippage (direction-aware)
+    breakeven = entry * 1.0018 if direction == "LONG" else entry * 0.9982
     leverage = _confidence_to_leverage(confidence)
 
     # ─── SCALPING GATE: Must be at a key level ─────────────────
     # For scalping, never enter in no-man's land.
-    # Price must be at a pullback level, S/R zone, or VWAP.
-    at_key_level = has_pullback or has_sr or has_vwap
+    # Price must be at a pullback level, S/R zone, VWAP, or a
+    # detected S/A-tier setup trigger (flag breakout, S/R flip, ...).
+    at_key_level = has_pullback or has_sr or has_vwap or has_setup
     if not at_key_level:
         reasons.append("REJECTED: Price is not at a key level (no pullback, no S/R, no VWAP). Wait for price to come to you.")
         return _no_trade("Not at a key level — wait for better entry", reasons=reasons)
@@ -179,10 +185,41 @@ def _safety_checks(row, prev) -> dict:
 
 # ─── Long Scoring ──────────────────────────────────────────────
 
-def _check_long(row, prev, htf_data=None) -> tuple:
+def _check_long(row, prev, htf_data=None, setups=None) -> tuple:
     """Check long entry conditions with full pattern analysis."""
     score = 0
     reasons = []
+
+    # ── 0. SETUP PLAYBOOK (tiered patterns) ────────────────────
+    if setups:
+        vol_ok = setups.get("volume_confirmed", False)
+        if setups.get("bull_flag"):
+            if vol_ok:
+                score += 2
+                reasons.append("S-TIER: Bull flag breakout with volume confirmation")
+            else:
+                reasons.append("Bull flag formed but breakout volume missing — fakeout risk, no points")
+        if setups.get("sr_flip_support"):
+            score += 1.5
+            reasons.append("S-TIER: S/R flip — broken resistance retested as support")
+        if setups.get("double_bottom"):
+            score += 1.5 if vol_ok else 1
+            reasons.append("A-TIER: Double bottom at neckline" + (" (volume confirmed)" if vol_ok else " (volume weak)"))
+        if setups.get("vol_contraction") and row["ema_9"] > row["ema_21"]:
+            score += 0.5
+            reasons.append("A-TIER: Volatility contraction in uptrend — coiling for breakout")
+        if setups.get("vwap_reclaim"):
+            score += 1
+            reasons.append("B-TIER: VWAP reclaim with RSI above 50")
+        if setups.get("three_white_soldiers"):
+            score += 1
+            reasons.append("Three white soldiers (strong continuation)")
+        if (setups.get("inside_bar") or setups.get("nr7")) and row["ema_9"] > row["ema_21"]:
+            score += 0.5
+            reasons.append("B-TIER: Inside bar/NR7 squeeze with trend")
+        if setups.get("dead_cat_bounce"):
+            score -= 3
+            reasons.append("WARNING: DEAD CAT BOUNCE structure — longing a weak low-volume bounce is the classic trap")
 
     # ── 1. TREND (EMA alignment) ───────────────────────────────
     if row.get("ema_cross_up", False):
@@ -281,10 +318,47 @@ def _check_long(row, prev, htf_data=None) -> tuple:
 
 # ─── Short Scoring ─────────────────────────────────────────────
 
-def _check_short(row, prev, htf_data=None) -> tuple:
+def _check_short(row, prev, htf_data=None, setups=None) -> tuple:
     """Check short entry conditions with full pattern analysis."""
     score = 0
     reasons = []
+
+    # ── 0. SETUP PLAYBOOK (tiered patterns) ────────────────────
+    if setups:
+        vol_ok = setups.get("volume_confirmed", False)
+        if setups.get("bear_flag"):
+            if vol_ok:
+                score += 2
+                reasons.append("S-TIER: Bear flag breakdown with volume confirmation")
+            else:
+                reasons.append("Bear flag formed but breakdown volume missing — fakeout risk, no points")
+        if setups.get("sr_flip_resistance"):
+            score += 1.5
+            reasons.append("S-TIER: S/R flip — broken support retested as resistance")
+        if setups.get("double_top"):
+            score += 1.5 if vol_ok else 1
+            reasons.append("A-TIER: Double top at neckline" + (" (volume confirmed)" if vol_ok else " (volume weak)"))
+        if setups.get("dead_cat_bounce"):
+            # Rejection candle present = full setup; otherwise early
+            has_rejection = row.get("shooting_star", False) or row.get("bearish_engulfing", False) or row.get("pin_bar_bear", False)
+            if has_rejection:
+                score += 2
+                reasons.append("A-TIER: Dead cat bounce SHORT — weak low-volume bounce rejected (RSI<50)")
+            else:
+                score += 1
+                reasons.append("Dead cat bounce structure forming — wait for the rejection candle before full size")
+        if setups.get("vol_contraction") and row["ema_9"] < row["ema_21"]:
+            score += 0.5
+            reasons.append("A-TIER: Volatility contraction in downtrend — coiling for breakdown")
+        if setups.get("vwap_rejection"):
+            score += 1
+            reasons.append("B-TIER: VWAP rejection with RSI below 50")
+        if setups.get("three_black_crows"):
+            score += 1
+            reasons.append("Three black crows (strong continuation)")
+        if (setups.get("inside_bar") or setups.get("nr7")) and row["ema_9"] < row["ema_21"]:
+            score += 0.5
+            reasons.append("B-TIER: Inside bar/NR7 squeeze with downtrend")
 
     # ── 1. TREND ───────────────────────────────────────────────
     if row.get("ema_cross_down", False):
@@ -380,6 +454,89 @@ def _check_short(row, prev, htf_data=None) -> tuple:
     return int(score), reasons
 
 
+# ─── Dual verification: deterministic setup check ──────────────
+
+def verify_trade_setup(df: pd.DataFrame, direction: str) -> dict:
+    """
+    Bot-side half of dual verification. The AI proposes the trade; this
+    independently confirms that at least one playbook setup actually exists
+    in the data for that direction. Returns:
+        {"verified": bool, "matched": [setup names], "warnings": [..]}
+
+    Universal rule: breakout-type setups (flag, squeeze, double-pattern
+    neckline) only count when the breakout candle carries above-average
+    volume — otherwise they are treated as fakeouts.
+    """
+    result = {"verified": False, "matched": [], "warnings": []}
+    if df is None or len(df) < 60 or direction not in ("LONG", "SHORT"):
+        result["warnings"].append("insufficient data for verification")
+        return result
+
+    setups = detect_setups(df)
+    row = df.iloc[-1]
+    vol_ok = setups.get("volume_confirmed", False)
+    at_level = bool(row.get("near_support") or row.get("near_resistance")
+                    or row.get("pullback_to_ema21") or row.get("pullback_to_vwap")
+                    or row.get("high_volume_node"))
+    # Single-candle signals only count when the candle is a STANDOUT bar
+    # (range >= 1.1x ATR). A real rejection is a thrust that dwarfs recent
+    # bars; in uniform chop every candle ~= ATR and none qualify.
+    atr = row.get("atr", 0)
+    sig_candle = bool(atr and not pd.isna(atr) and (row["high"] - row["low"]) >= 1.1 * atr)
+
+    if direction == "LONG":
+        checks = [
+            ("Bull flag breakout (S)", setups["bull_flag"], True),
+            ("S/R flip support retest (S)", setups["sr_flip_support"], False),
+            ("EMA 9/21 bullish cross (S)", bool(row.get("ema_cross_up", False)), False),
+            ("Double bottom (A)", setups["double_bottom"], True),
+            ("Volatility-contraction breakout (A)", setups["vol_contraction"] and row["ema_9"] > row["ema_21"], True),
+            ("VWAP reclaim + RSI>50 (B)", setups["vwap_reclaim"], False),
+            ("Three white soldiers", setups["three_white_soldiers"], False),
+            ("Inside bar/NR7 squeeze w/ trend (B)", (setups["inside_bar"] or setups["nr7"]) and row["ema_9"] > row["ema_21"], True),
+            ("Bullish engulfing at key level (B)", bool(row.get("bullish_engulfing", False)) and at_level and sig_candle, False),
+            ("Hammer/pin bar at key level (B)", bool(row.get("hammer", False) or row.get("pin_bar_bull", False)) and at_level and sig_candle, False),
+            ("Morning star", bool(row.get("morning_star", False)) and sig_candle, False),
+        ]
+        if setups["dead_cat_bounce"]:
+            result["warnings"].append(
+                "DEAD CAT BOUNCE structure detected — a LONG here buys a weak, "
+                "low-volume bounce in a fresh downtrend (the classic trap)"
+            )
+    else:
+        checks = [
+            ("Bear flag breakdown (S)", setups["bear_flag"], True),
+            ("S/R flip resistance retest (S)", setups["sr_flip_resistance"], False),
+            ("EMA 9/21 bearish cross (S)", bool(row.get("ema_cross_down", False)), False),
+            ("Double top (A)", setups["double_top"], True),
+            ("Dead cat bounce short (A)", setups["dead_cat_bounce"], False),
+            ("Volatility-contraction breakdown (A)", setups["vol_contraction"] and row["ema_9"] < row["ema_21"], True),
+            ("VWAP rejection + RSI<50 (B)", setups["vwap_rejection"], False),
+            ("Three black crows", setups["three_black_crows"], False),
+            ("Inside bar/NR7 squeeze w/ downtrend (B)", (setups["inside_bar"] or setups["nr7"]) and row["ema_9"] < row["ema_21"], True),
+            ("Bearish engulfing at key level (B)", bool(row.get("bearish_engulfing", False)) and at_level and sig_candle, False),
+            ("Shooting star/pin bar at key level (B)", bool(row.get("shooting_star", False) or row.get("pin_bar_bear", False)) and at_level and sig_candle, False),
+            ("Evening star", bool(row.get("evening_star", False)) and sig_candle, False),
+        ]
+
+    needs_volume_only = []
+    for name, hit, needs_volume in checks:
+        if not hit:
+            continue
+        if needs_volume and not vol_ok:
+            needs_volume_only.append(name)
+            continue
+        result["matched"].append(name)
+
+    if needs_volume_only and not result["matched"]:
+        result["warnings"].append(
+            f"Setup(s) present but breakout volume is below average — fakeout risk: {', '.join(needs_volume_only)}"
+        )
+
+    result["verified"] = len(result["matched"]) > 0
+    return result
+
+
 # ─── Exit Check ────────────────────────────────────────────────
 
 def check_exit(df: pd.DataFrame, direction: str, entry_price: float,
@@ -436,7 +593,7 @@ def _dynamic_atr_multipliers(confidence: int) -> tuple:
 
 
 def _confidence_to_leverage(confidence: int) -> int:
-    """Map confidence to leverage. Capped at 12x for safety."""
+    """Map confidence to leverage (delegates to risk_manager, capped at 25x)."""
     from risk_manager import get_leverage_for_confidence
     return get_leverage_for_confidence(confidence)
 

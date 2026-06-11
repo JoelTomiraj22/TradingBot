@@ -10,14 +10,18 @@ Flow:
   6. User confirms → Bot executes
 
 Provider priority (falls back automatically):
-  1. Gemini 2.5 Flash   (Google AI Studio — primary)
-  2. Groq Llama 3.3 70B (Groq — fast second opinion)
-  3. NVIDIA DeepSeek R1 (NVIDIA NIM — reasoning fallback)
-  4. Qwen2.5 72B        (HuggingFace — last resort)
+  1. DeepSeek V4 Pro (NVIDIA NIM) — primary reasoning analyst
+     (model fallbacks: Llama 3.3 70B, Nemotron Ultra 253B)
+  2. Qwen 3.5 397B (NVIDIA NIM)   — fallback
+     (model fallbacks: Nemotron Ultra 253B, Llama 3.3 70B)
+  3. Gemini 2.5 Pro -> Flash      — key rotation across GEMINI_PRO_API_KEYS + GEMINI_API_KEY
+  4. OpenRouter free pool         — deepseek-r1:free / deepseek-v3:free / llama-3.3-70b:free / gpt-oss / auto
+  5. Groq Llama 3.3 70B           — last resort
 
-Setup:
-  pip install groq openai
-  Add to .env: GEMINI_API_KEY, GROQ_API_KEY, NVIDIA_API_KEY, HF_API_KEY
+Setup (.env):
+  NVIDIA_DEEPSEEK_API_KEY, NVIDIA_QWEN_API_KEY (fallback: NVIDIA_API_KEY)
+  GEMINI_PRO_API_KEYS (comma-separated), GEMINI_API_KEY (flash)
+  OPENROUTER_API_KEY, GROQ_API_KEY
 """
 
 import os
@@ -88,16 +92,26 @@ ANALYZE_SYSTEM = """You are an elite crypto futures trader with 15+ years experi
 - Alignment across 3+ timeframes = high confidence. Conflicting TFs = low confidence or NO_TRADE.
 - Use higher TF S/R levels for SL/TP placement — they're stronger than lower TF levels.
 
-**Trade Types:**
-- SCALP (1m–5m entry): Hold 5–30 min. SL tight. Need very clear pattern + momentum.
-- INTRADAY (5m–15m entry): Hold 30 min – 4 hours. More room for SL. Best R:R potential.
-- SWING (30m–1h entry): Hold 4–24 hours. Wide SL. Only on very strong setups.
+**Trade Types (this trader ONLY scalps; intraday is rare; SWING is FORBIDDEN):**
+- SCALP (1m–5m entry): Hold 5–30 min. The DEFAULT and strongly preferred mode. SL tight. Need very clear pattern + momentum.
+- INTRADAY (5m–15m entry): Hold 30 min – 4 hours. Only when the setup is clearly superior to any scalp.
+- NEVER output trade_type "SWING". If the only valid setup is swing-grade (multi-hour/day hold), return NO_TRADE.
 
 **Strict Rules:**
-- NEVER chase: Price must be at a key level (EMA pullback, VWAP, S/R zone).
+- NO CHASING — EVER (hard rule): If price is not within ~0.1% of the ideal entry RIGHT NOW, you MUST return WAIT with the exact limit-entry level. Chasing a moving price is like trying to catch the wind — you place the trade where price WILL come, not where it is. A LONG/SHORT verdict is ONLY allowed when price is sitting at the level this instant.
 - Require 3+ confluences across timeframes.
 - SL: Place beyond structure on the ENTRY timeframe. Never at round numbers.
+- ANTI-STOP-HUNT: Check the wicks of the last 10–20 entry-TF candles. The SL must sit BEYOND the recent wick cluster AND beyond the structure level with a 0.1–0.2% buffer. Round numbers and obvious swing points are liquidity targets — never park the SL there. If a safe SL would make the R:R unacceptable, that is a WAIT or NO_TRADE, not a tighter SL.
+- LIQUIDITY-SWEEP ENTRIES: Retail stop clusters sit just beyond obvious swing lows/highs, equal highs/lows, and round numbers. Price is magnetically drawn to sweep these pools before reversing. The smartest WAIT limit-entry is placed AT such a sweep zone (e.g. a LONG entry just below equal lows / obvious support where stops cluster — the sweep fills you at the best price while weak hands get stopped out). Your SL must NEVER sit inside a liquidity pool; your ENTRY often should.
 __TP_RULES__
+
+**SETUP PLAYBOOK — trade ONLY setups from this list (tier = edge):**
+- S-tier (best for scalps): BULL/BEAR FLAG breakout (impulse pole, tight low-volume consolidation, volume spike on break, R:R 3:1+); EMA 9/21 CROSS with price on the right side + RSI/volume confirm (avoid in chop); S/R FLIP (broken level retested from the other side — tight SL just beyond the flipped level, best at session/prior-day levels and round numbers).
+- A-tier (need confirmation): VOLATILITY CONTRACTION breakout (progressively tighter pullbacks, volume drying up — enter the first pullback after the breakout candle, never mid-contraction); DOUBLE BOTTOM/TOP (second test slightly higher/lower, neckline break on rising volume, measured target = pattern height); ASC/DESC TRIANGLE break toward the flat side; DEAD CAT BOUNCE short — high-volume dump then weak bounce (low volume, <=50% retrace, RSI fails 50, indecisive candles): NEVER short mid-bounce, wait for the rejection candle at the flipped S/R, SL just above the bounce high, target prior structure low. If bounce volume >= drop volume it may be a real reversal (double bottom) — do not short.
+- B-tier (extra confluence required): INSIDE BAR / NR7 squeeze with HTF trend bias; HAMMER/PIN BAR/DOJI only AT a key S/R-EMA-VWAP confluence (worthless in isolation); VWAP RECLAIM/REJECTION with RSI crossing 50, strongest near session open.
+- C-tier (avoid for scalps): intraday HEAD & SHOULDERS, WEDGES — slow, high fakeout rate; use only to read structure.
+- UNIVERSAL RULE: no breakout is valid without ABOVE-AVERAGE VOLUME on the breakout candle — otherwise assume fakeout and WAIT.
+- DUAL VERIFICATION: each timeframe's data includes a deterministic "SETUPS DETECTED" line. Your LONG/SHORT verdict MUST be backed by at least one detected S/A-tier setup (or a B-tier setup plus strong multi-TF confluence) and you MUST name the setup in "reasons". The bot independently re-verifies and blocks unbacked trades.
 - Leverage: Max 25x. Scale: 7→5x, 8→8x, 9→15x, 10→25x.
 - Reject if: HTF trend conflicts, RSI extreme, overextended, chasing.
 
@@ -109,7 +123,7 @@ __TP_RULES__
 **Trader's Request:**
 You will be told the trader's available capital, preferred trading mode (SCALP/INTRADAY/SWING, or "ANY" to let you pick), preferred leverage (or "AI decides"), profit target, and max loss tolerance. Use this:
 - If a preferred mode is given, prioritize finding a valid setup of that type. If found, set "trade_type" to it.
-- If the preferred mode has NO valid setup but a different mode does, use that other mode for your main verdict instead and explain the substitution in "mode_note" (e.g. "No SCALP setup — 1h trend supports an INTRADAY short instead").
+- If the preferred mode has NO valid setup but a different mode does, use that other mode for your main verdict instead and explain the substitution in "mode_note" (e.g. "No SCALP setup — 1h trend supports an INTRADAY short instead"). The substitute can ONLY be SCALP or INTRADAY — never SWING.
 - Optionally list other viable setups in different trade_types in "alternative_setups" — even if your main verdict already matches the preferred mode. Each entry: trade_type, direction, entry, stop_loss, take_profit, leverage, reason.
 - If profit target / max loss are given, prefer SL/TP placements that roughly fit them — but NEVER break the SL structure rules or the 2.2:1 R:R minimum just to hit a target.
 - If NO mode has a valid setup at all, return direction "NO_TRADE" and leave "mode_note" explaining why none of the requested (or any) modes work right now.
@@ -124,8 +138,10 @@ You will be told the trader's available capital, preferred trading mode (SCALP/I
   "take_profit": number,
   "leverage": number,
   "timeframe": "1m" or "3m" or "5m" or "15m" or "30m" or "1h",
-  "trade_type": "SCALP" or "INTRADAY" or "SWING",
+  "trade_type": "SCALP" or "INTRADAY" (NEVER "SWING"),
   "hold_time": "estimated hold time e.g. 15min, 2h, etc.",
+  "eta_minutes": number — realistic estimate of MINUTES for price to reach TP from entry (base it on TP distance vs entry-TF ATR per candle and current momentum; a scalp should usually be 5-30),
+  "eta_basis": "one line explaining the time estimate, e.g. 'TP is 1.4x ATR(5m) away; momentum strong, ~3-5 candles'",
   "risk_score": "LOW" or "MEDIUM" or "HIGH",
   "wait_condition": "WAIT only: exact condition to watch e.g. 'Price pulls back to 15m EMA21 at $207.05'",
   "wait_direction": "WAIT only: the trade direction once condition is met — LONG or SHORT",
@@ -146,11 +162,17 @@ SCAN_SYSTEM = """You are an elite crypto futures trader. You receive multi-timef
 3. Find the best entry on lower TFs (1m–15m).
 4. Pick max 3 best setups across ALL coins.
 
-**Rules:**
+**Rules (this trader ONLY scalps; intraday rare; SWING is FORBIDDEN):**
 - 3+ confluences across timeframes required
 - Never chase — must be at a key level on the entry TF
+- NO CHASING — EVER: only pick coins where the entry is actionable RIGHT NOW (price within ~0.1% of the level). A coin that "needs a pullback first" is not a pick — chasing is forbidden.
+- ANTI-STOP-HUNT: SL must sit beyond the recent 10–20 candle wick cluster with a 0.1–0.2% buffer — never at round numbers or obvious swing points (those are liquidity pools where stops get hunted).
+- The best entries sit AT liquidity-sweep zones (just beyond obvious swing points where stops cluster) — entries there are smart, SLs there are suicide.
+- SETUP PLAYBOOK: only pick coins showing a detected S/A-tier setup on the "SETUPS DETECTED" line (flag breakout, S/R flip, double bottom/top, volatility contraction, dead-cat-bounce short) or a B-tier setup (inside bar/NR7, VWAP reclaim/rejection, candle at key level) with strong multi-TF confluence. Name the setup in reasons.
+- UNIVERSAL VOLUME RULE: a breakout without above-average volume on the break candle is a fakeout — skip it.
+- DEAD CAT BOUNCE warning lines mean: do NOT long that coin; short only on a confirmed rejection candle.
 __TP_RULES__
-- Higher TF S/R levels are stronger — use them for TP targets on INTRADAY/SWING
+- trade_type must be "SCALP" (preferred) or "INTRADAY" (only if clearly superior). NEVER "SWING" — skip swing-grade setups entirely.
 - Max 3 picks, ranked by quality. Return [] if nothing is good.
 
 **Output ONLY valid JSON array (no markdown, no code fences):**
@@ -164,8 +186,10 @@ __TP_RULES__
     "take_profit": number,
     "leverage": number,
     "timeframe": "best entry TF",
-    "trade_type": "SCALP" or "INTRADAY" or "SWING",
+    "trade_type": "SCALP" or "INTRADAY" (NEVER "SWING"),
     "hold_time": "estimated hold time",
+    "eta_minutes": number — realistic minutes for price to reach TP (TP distance vs ATR per candle + momentum),
+    "eta_basis": "one line explaining the time estimate",
     "risk_score": "LOW" or "MEDIUM" or "HIGH",
     "reasons": ["reason 1 (mention TF)", ...],
     "advice": "One line"
@@ -337,6 +361,30 @@ def _build_tf_snapshot(df: pd.DataFrame, tf: str, full_detail: bool = False) -> 
     if patterns:
         snapshot += f"\n    PATTERNS: {', '.join(patterns)}"
 
+    # Detected playbook setups (deterministic — the bot verifies these too)
+    try:
+        from indicators import detect_setups
+        s = detect_setups(df)
+        found = [label for key, label in [
+            ("bull_flag", "BULL FLAG (S)"), ("bear_flag", "BEAR FLAG (S)"),
+            ("sr_flip_support", "S/R FLIP->SUPPORT (S)"), ("sr_flip_resistance", "S/R FLIP->RESISTANCE (S)"),
+            ("double_bottom", "DOUBLE BOTTOM (A)"), ("double_top", "DOUBLE TOP (A)"),
+            ("vol_contraction", "VOLATILITY CONTRACTION (A)"),
+            ("vwap_reclaim", "VWAP RECLAIM (B)"), ("vwap_rejection", "VWAP REJECTION (B)"),
+            ("inside_bar", "INSIDE BAR"), ("nr7", "NR7"),
+            ("three_white_soldiers", "3 WHITE SOLDIERS"), ("three_black_crows", "3 BLACK CROWS"),
+        ] if s.get(key)]
+        if found:
+            vol_note = "breakout volume OK" if s.get("volume_confirmed") else "NO breakout volume — fakeout risk"
+            snapshot += f"\n    SETUPS DETECTED: {', '.join(found)} ({vol_note})"
+        if s.get("dead_cat_bounce"):
+            bh = s.get("dcb_bounce_high")
+            bh_txt = f" (bounce high {bh:.6f})" if bh else ""
+            snapshot += (f"\n    WARNING: DEAD CAT BOUNCE structure{bh_txt} — weak low-volume bounce "
+                         f"after a high-volume dump. Do NOT long; short only on rejection candle, SL above bounce high.")
+    except Exception:
+        pass
+
     # Pullback / chasing
     pullbacks = []
     if row.get("pullback_to_ema21", False):
@@ -449,19 +497,22 @@ def build_btc_context(btc_tf_data: dict) -> str:
 
 # ─── JSON parsers ────────────────────────────────────────────
 
-def _repair_truncated_json(text: str) -> str:
-    """Best-effort repair for a JSON object cut off mid-stream (hit max_tokens).
+def _truncation_repair_candidates(text: str):
+    """Yield progressively shorter repairs of a JSON object cut off
+    mid-stream (hit max_tokens or the provider stopped early).
 
-    Trims back to the last complete "key": value pair and closes any
-    still-open braces/brackets, so we can recover early fields (direction,
-    entry, stop_loss, take_profit, leverage, ...) even if later fields
-    (reasons, advice, alternative_setups, ...) never arrived.
+    Walks every comma at object/array depth, then — starting from the LAST
+    complete "key": value pair and stepping backwards — trims the text there
+    and closes any still-open braces/brackets. Trying multiple trim points
+    matters: the content right before the cut can itself be invalid (e.g.
+    `"timeframe": ` with no value, or an unquoted token), in which case only
+    an earlier trim point produces parseable JSON. Early fields (direction,
+    entry, stop_loss, take_profit, leverage, ...) are usually recoverable.
     """
     stack = []
     in_string = False
     escape = False
-    last_safe = -1
-    last_safe_stack = None
+    safe_points = []  # (index, stack snapshot) at each top-level-ish comma
 
     for i, ch in enumerate(text):
         if escape:
@@ -481,14 +532,15 @@ def _repair_truncated_json(text: str) -> str:
             if stack:
                 stack.pop()
         elif ch == "," and stack:
-            last_safe = i
-            last_safe_stack = list(stack)
+            safe_points.append((i, list(stack)))
 
-    if not stack or last_safe == -1 or last_safe_stack is None:
-        return text
+    if not stack:
+        return  # brackets balanced — truncation repair doesn't apply
 
-    closers = "".join("}" if c == "{" else "]" for c in reversed(last_safe_stack))
-    return text[:last_safe] + closers
+    # Try the most recent 30 trim points, newest first
+    for i, st in reversed(safe_points[-30:]):
+        closers = "".join("}" if c == "{" else "]" for c in reversed(st))
+        yield text[:i] + closers
 
 
 def _strip_trailing_commas(text: str) -> str:
@@ -516,13 +568,79 @@ def _load_json_lenient(clean: str) -> tuple:
         except json.JSONDecodeError:
             pass
 
-    repaired = _repair_truncated_json(clean)
-    if repaired != clean:
-        repaired = _strip_trailing_commas(repaired)
-        return json.loads(repaired), True
+    # Truncated mid-stream — walk back one "key": value pair at a time
+    # until a trim point yields valid JSON.
+    for candidate in _truncation_repair_candidates(clean):
+        try:
+            return json.loads(_strip_trailing_commas(candidate)), True
+        except json.JSONDecodeError:
+            continue
 
     # Nothing recoverable — re-raise the original error.
     return json.loads(clean), False
+
+
+def _to_int_or_none(v):
+    """Lenient int conversion for AI numeric fields (eta_minutes etc.)."""
+    try:
+        n = int(float(v))
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanity_check_verdict(v: dict) -> dict:
+    """
+    Deterministic sanity gate on a parsed AI verdict. Models sometimes emit
+    absurd targets (e.g. SL 2.05% with TP 0.18% -> R:R 0.09:1) — such a
+    verdict must never be allowed to drive a trade or an ensemble decision.
+    Demotes broken LONG/SHORT verdicts to NO_TRADE with the reason attached.
+
+    WAIT verdicts are checked the same way against wait_direction, since the
+    entry/SL/TP they carry become a real LONG/SHORT trade (via a limit order)
+    the moment the trigger condition fills — inverted levels here are just as
+    dangerous as inverted levels on a direct LONG/SHORT verdict.
+    """
+    direction = v.get("direction")
+    if direction not in ("LONG", "SHORT", "WAIT"):
+        return v
+    entry, sl, tp = v.get("entry"), v.get("stop_loss"), v.get("take_profit")
+    if not entry or not sl or not tp:
+        return v
+
+    try:
+        sl_dist = abs(entry - sl) / entry * 100
+        tp_dist = abs(tp - entry) / entry * 100
+    except (TypeError, ZeroDivisionError):
+        return v
+
+    # The direction whose SL/TP ordering rules apply — for WAIT verdicts
+    # that's wait_direction (the trade actually taken once the limit fills).
+    trade_dir = direction if direction in ("LONG", "SHORT") else v.get("wait_direction")
+
+    rr = (tp_dist / sl_dist) if sl_dist > 0 else 0
+    problems = []
+    if rr < 1.0:
+        problems.append(f"R:R {rr:.2f}:1 — risking more than the reward")
+    if tp_dist < 0.30:
+        problems.append(f"TP only {tp_dist:.2f}% away — inside the 0.18% friction zone")
+    if sl_dist > 3.0 and v.get("trade_type", "SCALP") == "SCALP":
+        problems.append(f"SL {sl_dist:.2f}% from entry is not a scalp stop")
+    if trade_dir == "LONG" and not (sl < entry < tp):
+        problems.append("levels inconsistent with LONG (need SL < entry < TP)")
+    elif trade_dir == "SHORT" and not (tp < entry < sl):
+        problems.append("levels inconsistent with SHORT (need TP < entry < SL)")
+    elif trade_dir not in ("LONG", "SHORT"):
+        problems.append(f"WAIT verdict has invalid wait_direction {trade_dir!r}")
+
+    if problems:
+        v = dict(v)
+        v["direction"] = "NO_TRADE"
+        v["confidence"] = 0
+        v["reasons"] = list(v.get("reasons", [])) + [
+            f"SANITY GATE: verdict discarded — {'; '.join(problems)}"
+        ]
+    return v
 
 
 def _parse_analysis_response(text: str) -> dict:
@@ -547,7 +665,7 @@ def _parse_analysis_response(text: str) -> dict:
         if repaired:
             reasons = list(reasons) + ["Note: AI response was truncated (hit token limit) — recovered partial verdict."]
 
-        return {
+        result = {
             "direction": str(data.get("direction", "NO_TRADE")).upper(),
             "confidence": int(data.get("confidence", 0)),
             "entry": data.get("entry"),
@@ -557,6 +675,8 @@ def _parse_analysis_response(text: str) -> dict:
             "timeframe": str(data.get("timeframe", "5m")),
             "trade_type": trade_type,
             "hold_time": HOLD_TIME_BY_TYPE.get(trade_type, str(data.get("hold_time", "15-30 min"))),
+            "eta_minutes": _to_int_or_none(data.get("eta_minutes")),
+            "eta_basis": str(data.get("eta_basis", "")),
             "risk_score": str(data.get("risk_score", "UNKNOWN")).upper(),
             "wait_condition": str(data.get("wait_condition", "")),
             "wait_direction": str(data.get("wait_direction", "")).upper(),
@@ -565,6 +685,19 @@ def _parse_analysis_response(text: str) -> dict:
             "reasons": reasons,
             "advice": str(data.get("advice", "")),
         }
+
+        # Hard policy: no swing trades — even if the model ignores the prompt.
+        if result["trade_type"] == "SWING" and result["direction"] in ("LONG", "SHORT", "WAIT"):
+            result["direction"] = "NO_TRADE"
+            result["confidence"] = 0
+            result["reasons"] = list(result["reasons"]) + [
+                "AI's best setup was SWING-grade — swing trading is disabled (scalping-focused bot). Skipped."
+            ]
+
+        # Deterministic sanity gate — absurd levels never drive a trade
+        result = _sanity_check_verdict(result)
+
+        return result
 
     except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError):
         return {
@@ -577,6 +710,8 @@ def _parse_analysis_response(text: str) -> dict:
             "timeframe": "5m",
             "trade_type": "SCALP",
             "hold_time": "",
+            "eta_minutes": None,
+            "eta_basis": "",
             "risk_score": "UNKNOWN",
             "wait_condition": "",
             "wait_direction": "",
@@ -656,7 +791,10 @@ def _parse_scan_response(text: str) -> list:
         results = []
         for item in data:
             trade_type = str(item.get("trade_type", "SCALP")).upper()
-            results.append({
+            if trade_type == "SWING":
+                # Hard policy: swing trades disabled — drop the pick entirely.
+                continue
+            pick = {
                 "symbol": str(item.get("symbol", "")),
                 "direction": str(item.get("direction", "NO_TRADE")).upper(),
                 "confidence": int(item.get("confidence", 0)),
@@ -667,10 +805,16 @@ def _parse_scan_response(text: str) -> list:
                 "timeframe": str(item.get("timeframe", "5m")),
                 "trade_type": trade_type,
                 "hold_time": HOLD_TIME_BY_TYPE.get(trade_type, str(item.get("hold_time", "15-30 min"))),
+                "eta_minutes": _to_int_or_none(item.get("eta_minutes")),
+                "eta_basis": str(item.get("eta_basis", "")),
                 "risk_score": str(item.get("risk_score", "UNKNOWN")).upper(),
                 "reasons": item.get("reasons", []),
                 "advice": str(item.get("advice", "")),
-            })
+            }
+            # Sanity gate — drop scan picks with absurd levels entirely
+            pick = _sanity_check_verdict(pick)
+            if pick["direction"] in ("LONG", "SHORT"):
+                results.append(pick)
         return results
 
     except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError):
@@ -679,65 +823,88 @@ def _parse_scan_response(text: str) -> list:
 
 # ─── AI Callers ──────────────────────────────────────────────
 
+def _gemini_keys() -> tuple:
+    """Return (pro_keys, all_keys) from GEMINI_PRO_API_KEYS + GEMINI_API_KEY."""
+    pro_keys = [k.strip() for k in os.getenv("GEMINI_PRO_API_KEYS", "").split(",") if k.strip()]
+    flash_key = os.getenv("GEMINI_API_KEY", "").strip()
+    all_keys = pro_keys + ([flash_key] if flash_key and flash_key not in pro_keys else [])
+    return pro_keys, all_keys
+
+
 def _call_gemini(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
-    """Call Gemini 2.5 Flash via Google AI Studio REST API.
+    """Call Gemini — 2.5 Pro first (rotating across GEMINI_PRO_API_KEYS on
+    429/error), then 2.5 Flash on every available key.
 
     json_mode is accepted for signature parity with the other providers but
     has no effect — Gemini's responseMimeType="application/json" already
     handles both JSON objects and arrays.
     """
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        return {"error": "No GEMINI_API_KEY in .env", "skipped": True, "source": "gemini"}
-
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    pro_keys, all_keys = _gemini_keys()
+    if not all_keys:
+        return {"error": "No GEMINI_PRO_API_KEYS / GEMINI_API_KEY in .env", "skipped": True, "source": "gemini"}
 
     full_prompt = f"{system or ANALYZE_SYSTEM}\n\n{prompt}"
 
-    payload = {
-        "contents": [
-            {"parts": [{"text": full_prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json",
-            # Gemini 2.5 Flash reserves part of maxOutputTokens for internal
-            # "thinking" by default, which can starve the actual JSON output
-            # and cause it to be cut off mid-object. Disable it.
-            "thinkingConfig": {"thinkingBudget": 0},
+    # (model, key, label, thinking_budget) attempts in priority order.
+    # Pro can't fully disable thinking — bound it; Flash: disable thinking
+    # so it can't starve the JSON output.
+    attempts = [("gemini-2.5-pro", k, "Gemini 2.5 Pro", 1024) for k in pro_keys]
+    attempts += [("gemini-2.5-flash", k, "Gemini 2.5 Flash", 0) for k in all_keys]
+
+    last_error = None
+    for model, api_key, label, think_budget in attempts:
+        # Key routing: "AQ."-prefixed keys are Vertex AI EXPRESS keys and
+        # only work on aiplatform.googleapis.com; classic "AIza" keys use
+        # generativelanguage.googleapis.com. Try the matching endpoint
+        # first, the other as backup.
+        vertex_url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent"
+        genlang_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        urls = [vertex_url, genlang_url] if api_key.startswith("AQ.") else [genlang_url, vertex_url]
+
+        payload = {
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": think_budget},
+            },
         }
-    }
+        headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key,
-    }
+        for url in urls:
+            try:
+                start = time.time()
+                resp = requests.post(url, json=payload, headers=headers, timeout=60)
+                # Some Google gateways only accept the key as a query param
+                # (?key=...) instead of the X-goog-api-key header — retry once.
+                if resp.status_code in (400, 401, 403):
+                    resp = requests.post(f"{url}?key={api_key}", json=payload,
+                                         headers={"Content-Type": "application/json"}, timeout=60)
+                elapsed = time.time() - start
 
-    try:
-        start = time.time()
-        resp = requests.post(url, json=payload, headers=headers, timeout=45)
-        elapsed = time.time() - start
+                if resp.status_code != 200:
+                    last_error = f"{label} HTTP {resp.status_code}: {resp.text[:150]}"
+                    continue  # try the other endpoint, then next key/model
 
-        if resp.status_code != 200:
-            error_msg = resp.text[:200]
-            return {"error": f"HTTP {resp.status_code}: {error_msg}", "skipped": True, "source": "gemini"}
+                data = resp.json()
+                candidate = data["candidates"][0]
+                if candidate.get("finishReason") == "MAX_TOKENS":
+                    last_error = f"{label}: truncated (hit max output tokens)"
+                    continue
+                text = candidate["content"]["parts"][0]["text"]
+                return {
+                    "raw_text": text,
+                    "source": "gemini",
+                    "model": label,
+                    "time": round(elapsed, 1),
+                    "skipped": False,
+                }
+            except Exception as e:
+                last_error = f"{label}: {e}"
+                continue
 
-        data = resp.json()
-        candidate = data["candidates"][0]
-        if candidate.get("finishReason") == "MAX_TOKENS":
-            return {"error": "Response truncated (hit max output tokens)", "skipped": True, "source": "gemini"}
-        text = candidate["content"]["parts"][0]["text"]
-        return {
-            "raw_text": text,
-            "source": "gemini",
-            "model": "Gemini 2.5 Flash",
-            "time": round(elapsed, 1),
-            "skipped": False,
-        }
-
-    except Exception as e:
-        return {"error": str(e), "source": "gemini", "skipped": True}
+    return {"error": last_error or "All Gemini attempts failed", "source": "gemini", "skipped": True}
 
 
 def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
@@ -786,65 +953,157 @@ def _call_groq(prompt: str, system: str = None, max_tokens: int = 2048, temperat
         return {"error": str(e), "source": "groq", "skipped": True}
 
 
-def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
-    """
-    Call NVIDIA NIM via direct REST (no openai package needed).
-    Tries llama-3.1-70b-instruct first (widely available), then deepseek-r1.
+def _strip_think(text: str) -> str:
+    """Strip <think>...</think> reasoning blocks (DeepSeek R1, Qwen3)."""
+    if "<think>" in text:
+        after = text.find("</think>")
+        return text[after + 8:].strip() if after >= 0 else text
+    return text
 
-    json_mode is accepted for signature parity but not sent — response_format
-    support varies across NIM-hosted models, and a 400 there would skip the
-    whole provider rather than just fall back to plain-text JSON parsing.
-    """
-    api_key = os.getenv("NVIDIA_API_KEY", "")
+
+_NVIDIA_BASE_URLS = [
+    "https://integrate.api.nvidia.com/v1/chat/completions",
+    "https://ai.api.nvidia.com/v1/chat/completions",
+]
+
+
+def _nvidia_keys(key_envs: list) -> list:
+    """All distinct non-empty keys from the env list (dedicated first,
+    generic NVIDIA_API_KEY fallback second)."""
+    keys = []
+    for e in key_envs:
+        k = os.getenv(e, "").strip()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+# NVIDIA NIM model chains: primary model first, then shared fallbacks so a
+# delisted/renamed primary never kills the whole provider.
+_DEEPSEEK_MODELS = [
+    ("deepseek-ai/deepseek-v4-pro", "DeepSeek V4 Pro (NVIDIA)"),
+    ("meta/llama-3.3-70b-instruct", "Llama 3.3 70B (NVIDIA)"),
+    ("nvidia/llama-3.1-nemotron-ultra-253b-v1", "Nemotron Ultra 253B (NVIDIA)"),
+]
+_QWEN_MODELS = [
+    ("qwen/qwen3.5-397b-a17b", "Qwen 3.5 397B (NVIDIA)"),
+    ("nvidia/llama-3.1-nemotron-ultra-253b-v1", "Nemotron Ultra 253B (NVIDIA)"),
+    ("meta/llama-3.3-70b-instruct", "Llama 3.3 70B (NVIDIA)"),
+]
+
+
+def _call_nvidia_model(source: str, models: list, key_envs: list,
+                       prompt: str, system: str, max_tokens: int,
+                       temperature: float) -> dict:
+    """Shared NVIDIA NIM caller (REST). Tries each model in the chain across
+    every available key and gateway — a per-key 'Public API Endpoints' issue
+    (plain '404 page not found') or a delisted model shouldn't kill the
+    provider. Reasoning models think in <think> blocks that consume output
+    tokens — enforce a generous floor so the JSON answer survives."""
+    keys = _nvidia_keys(key_envs)
+    if not keys:
+        return {"error": f"No {key_envs[0]} in .env", "skipped": True, "source": source}
+
+    last_error = None
+    for model_id, label in models:
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": f"{system or ANALYZE_SYSTEM}\n\n{prompt}"}],
+            "max_tokens": max(max_tokens, 8192),  # room for <think> + JSON
+            "temperature": temperature,
+        }
+        for api_key in keys:
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            for url in _NVIDIA_BASE_URLS:
+                try:
+                    start = time.time()
+                    resp = requests.post(url, json=payload, headers=headers, timeout=120)
+                    elapsed = time.time() - start
+                    if resp.status_code != 200:
+                        last_error = f"{model_id}: HTTP {resp.status_code}: {resp.text[:100]}"
+                        continue
+                    text = _strip_think(resp.json()["choices"][0]["message"]["content"] or "")
+                    if not text.strip():
+                        last_error = f"{model_id}: empty response"
+                        continue
+                    return {
+                        "raw_text": text,
+                        "source": source,
+                        "model": label,
+                        "time": round(elapsed, 1),
+                        "skipped": False,
+                    }
+                except Exception as e:
+                    last_error = f"{model_id}: {e}"
+                    continue
+
+    return {"error": last_error or "All NVIDIA attempts failed", "skipped": True, "source": source}
+
+
+def _call_deepseek(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
+    """DeepSeek V4 Pro via NVIDIA NIM — primary reasoning analyst."""
+    return _call_nvidia_model(
+        "deepseek", _DEEPSEEK_MODELS,
+        ["NVIDIA_DEEPSEEK_API_KEY", "NVIDIA_API_KEY"],
+        prompt, system, max_tokens, temperature,
+    )
+
+
+def _call_qwen3(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
+    """Qwen 3.5 397B via NVIDIA NIM — first fallback."""
+    return _call_nvidia_model(
+        "qwen3", _QWEN_MODELS,
+        ["NVIDIA_QWEN_API_KEY", "NVIDIA_API_KEY"],
+        prompt, system, max_tokens, temperature,
+    )
+
+
+def _call_openrouter(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
+    """OpenRouter free pool — deepseek-r1:free, then llama-3.3-70b:free.
+    Free tier is heavily rate-limited (~20 req/min, 50-200/day) — used as a
+    backup pool, not a primary."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        return {"error": "No NVIDIA_API_KEY in .env", "skipped": True, "source": "nvidia"}
+        return {"error": "No OPENROUTER_API_KEY in .env", "skipped": True, "source": "openrouter"}
 
-    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    # Try models in order of availability; stop on first success
-    models_to_try = [
-        ("meta/llama-3.1-70b-instruct", "Llama 3.1 70B (NVIDIA)"),
-        ("deepseek-ai/deepseek-r1", "DeepSeek R1 (NVIDIA)"),
-        ("nvidia/llama-3.1-nemotron-70b-instruct", "Nemotron 70B (NVIDIA)"),
-    ]
-
-    messages = [
-        {"role": "user", "content": f"{system or ANALYZE_SYSTEM}\n\n{prompt}"},
+    # Free pool is congested at peak times — try several free models, then
+    # the auto-router (picks any currently-live free model) as catch-all.
+    models = [
+        ("deepseek/deepseek-r1:free", "DeepSeek R1 (OpenRouter free)"),
+        ("deepseek/deepseek-chat-v3-0324:free", "DeepSeek V3 (OpenRouter free)"),
+        ("meta-llama/llama-3.3-70b-instruct:free", "Llama 3.3 70B (OpenRouter free)"),
+        ("openai/gpt-oss-120b:free", "GPT-OSS 120B (OpenRouter free)"),
+        ("openrouter/free", "Auto free model (OpenRouter)"),
     ]
 
     last_error = None
-    for model_id, model_label in models_to_try:
+    for model_id, label in models:
         payload = {
             "model": model_id,
-            "messages": messages,
-            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system or ANALYZE_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max(max_tokens, 8192) if "r1" in model_id else max_tokens,
             "temperature": temperature,
         }
         try:
             start = time.time()
-            resp = requests.post(url, json=payload, headers=headers, timeout=90)
+            resp = requests.post(url, json=payload, headers=headers, timeout=120)
             elapsed = time.time() - start
-
-            if resp.status_code == 404:
-                last_error = f"Model {model_id} not found (404)"
-                continue
-            if resp.status_code == 402:
-                last_error = f"Model {model_id} requires paid access (402)"
-                continue
             if resp.status_code != 200:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                last_error = f"{model_id} HTTP {resp.status_code}: {resp.text[:120]}"
                 continue
-
-            text = resp.json()["choices"][0]["message"]["content"] or ""
-            # DeepSeek R1 wraps reasoning in <think>...</think> — strip it
-            if "<think>" in text:
-                after = text.find("</think>")
-                text = text[after + 8:].strip() if after >= 0 else text
+            text = _strip_think(resp.json()["choices"][0]["message"]["content"] or "")
+            if not text.strip():
+                last_error = f"{model_id}: empty response"
+                continue
             return {
                 "raw_text": text,
-                "source": "nvidia",
-                "model": model_label,
+                "source": "openrouter",
+                "model": label,
                 "time": round(elapsed, 1),
                 "skipped": False,
             }
@@ -852,46 +1111,7 @@ def _call_nvidia(prompt: str, system: str = None, max_tokens: int = 2048, temper
             last_error = str(e)
             continue
 
-    return {"error": last_error or "All NVIDIA models failed", "source": "nvidia", "skipped": True}
-
-
-def _call_huggingface(prompt: str, system: str = None, max_tokens: int = 2048, temperature: float = 0.15, json_mode: bool = True) -> dict:
-    """Call Qwen2.5 72B via HuggingFace Serverless Inference API."""
-    api_key = os.getenv("HF_API_KEY", "")
-    if not api_key:
-        return {"error": "No HF_API_KEY in .env", "skipped": True, "source": "huggingface"}
-
-    model = "Qwen/Qwen2.5-72B-Instruct"
-    url = "https://router.huggingface.co/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system or ANALYZE_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    try:
-        start = time.time()
-        resp = requests.post(url, json=payload, headers=headers, timeout=60)
-        elapsed = time.time() - start
-        if resp.status_code != 200:
-            return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}", "skipped": True, "source": "huggingface"}
-        text = resp.json()["choices"][0]["message"]["content"]
-        return {
-            "raw_text": text,
-            "source": "huggingface",
-            "model": "Qwen2.5 72B (HuggingFace)",
-            "time": round(elapsed, 1),
-            "skipped": False,
-        }
-    except Exception as e:
-        return {"error": str(e), "source": "huggingface", "skipped": True}
+    return {"error": last_error or "All OpenRouter models failed", "skipped": True, "source": "openrouter"}
 
 
 # ─── Provider availability check (cached) ───────────────────
@@ -900,30 +1120,90 @@ _availability_cache: dict = {}
 _availability_checked_at: float = 0.0
 _AVAILABILITY_TTL = 300  # re-check every 5 minutes
 
+# Which env vars give a provider its key(s)
+_KEY_ENVS = {
+    "deepseek":   ["NVIDIA_DEEPSEEK_API_KEY", "NVIDIA_API_KEY"],
+    "qwen3":      ["NVIDIA_QWEN_API_KEY", "NVIDIA_API_KEY"],
+    "gemini":     ["GEMINI_PRO_API_KEYS", "GEMINI_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "groq":       ["GROQ_API_KEY"],
+}
 
-def _check_availability(timeout: int = 15, force: bool = False) -> dict:
+
+def _has_key(provider: str) -> bool:
+    return any(os.getenv(e, "").strip() for e in _KEY_ENVS.get(provider, []))
+
+
+def _check_availability(timeout: int = 8, force: bool = False) -> dict:
     """
     Ping all configured AI providers in parallel with a tiny request.
     Result is cached for 5 minutes — only runs once per session unless
     a provider fails mid-analysis (force=True re-runs immediately).
+    Pings are minimal (max_tokens<=5 or auth-only) to protect quotas.
     """
     global _availability_cache, _availability_checked_at
 
     if not force and _availability_cache and (time.time() - _availability_checked_at < _AVAILABILITY_TTL):
         return _availability_cache
 
-    ping = "Reply with the single word: READY"
+    ping = "READY?"
+
+    def _test_nvidia_key(key_envs, models):
+        for model_id, _label in models:
+            for api_key in _nvidia_keys(key_envs):
+                for url in _NVIDIA_BASE_URLS:
+                    try:
+                        r = requests.post(
+                            url,
+                            json={"model": model_id,
+                                  "messages": [{"role": "user", "content": ping}],
+                                  "max_tokens": 5},
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            timeout=timeout,
+                        )
+                        if r.status_code == 200:
+                            return True
+                    except Exception:
+                        continue
+        return False
+
+    def _test_deepseek():
+        return _test_nvidia_key(_KEY_ENVS["deepseek"], _DEEPSEEK_MODELS)
+
+    def _test_qwen3():
+        return _test_nvidia_key(_KEY_ENVS["qwen3"], _QWEN_MODELS)
 
     def _test_gemini():
-        api_key = os.getenv("GEMINI_API_KEY", "")
+        _, all_keys = _gemini_keys()
+        vertex = "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent"
+        genlang = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        body = {"contents": [{"parts": [{"text": ping}]}],
+                "generationConfig": {"maxOutputTokens": 5}}
+        for api_key in all_keys:
+            url = vertex if api_key.startswith("AQ.") else genlang
+            # header auth, then ?key= auth — some gateways accept only one
+            for kwargs in (
+                {"headers": {"X-goog-api-key": api_key}},
+                {"params": {"key": api_key}},
+            ):
+                try:
+                    r = requests.post(url, json=body, timeout=timeout, **kwargs)
+                    if r.status_code == 200:
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _test_openrouter():
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
         if not api_key:
             return False
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-        payload = {"contents": [{"parts": [{"text": ping}]}],
-                   "generationConfig": {"maxOutputTokens": 5}}
         try:
-            r = requests.post(url, json=payload,
-                              headers={"X-goog-api-key": api_key}, timeout=timeout)
+            # Auth-only check — costs zero tokens and zero daily requests
+            r = requests.get(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout,
+            )
             return r.status_code == 200
         except Exception:
             return False
@@ -944,52 +1224,22 @@ def _check_availability(timeout: int = 15, force: bool = False) -> dict:
         except Exception:
             return False
 
-    def _test_nvidia():
-        api_key = os.getenv("NVIDIA_API_KEY", "")
-        if not api_key:
-            return False
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        try:
-            r = requests.post(
-                url,
-                json={"model": "meta/llama-3.1-70b-instruct",  # fast ping model
-                      "messages": [{"role": "user", "content": ping}],
-                      "max_tokens": 5},
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                timeout=timeout,
-            )
-            return r.status_code == 200
-        except Exception:
-            return False
+    testers = {
+        "deepseek": _test_deepseek,
+        "qwen3": _test_qwen3,
+        "gemini": _test_gemini,
+        "openrouter": _test_openrouter,
+        "groq": _test_groq,
+    }
 
-    def _test_hf():
-        api_key = os.getenv("HF_API_KEY", "")
-        if not api_key:
-            return False
-        url = "https://router.huggingface.co/v1/chat/completions"
+    available = {name: False for name in testers}
+    with ThreadPoolExecutor(max_workers=len(testers)) as pool:
+        fs = {pool.submit(fn): name for name, fn in testers.items()}
         try:
-            r = requests.post(
-                url,
-                json={"model": "Qwen/Qwen2.5-72B-Instruct",
-                      "messages": [{"role": "user", "content": ping}],
-                      "max_tokens": 5},
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                timeout=timeout,
-            )
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    available = {"gemini": False, "groq": False, "nvidia": False, "huggingface": False}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fs = {
-            pool.submit(_test_gemini): "gemini",
-            pool.submit(_test_groq): "groq",
-            pool.submit(_test_nvidia): "nvidia",
-            pool.submit(_test_hf): "huggingface",
-        }
-        try:
-            for f in as_completed(fs, timeout=timeout + 2):
+            # Each tester may try several key/endpoint combos sequentially —
+            # give the overall window enough room (was timeout+2, which cut
+            # multi-attempt testers off and falsely marked them unreachable).
+            for f in as_completed(fs, timeout=timeout * 4 + 5):
                 name = fs[f]
                 try:
                     available[name] = f.result()
@@ -1008,10 +1258,11 @@ def _check_availability(timeout: int = 15, force: bool = False) -> dict:
 
 # Provider priority order and display metadata
 _PROVIDERS = [
-    ("gemini",      "Gemini 2.5 Flash",      BLUE,    _call_gemini),
-    ("groq",        "Groq Llama 3.3 70B",    MAGENTA, _call_groq),
-    ("nvidia",      "Llama 3.1 70B (NVIDIA)", CYAN,    _call_nvidia),
-    ("huggingface", "Qwen2.5 72B (HF)",      YELLOW,  _call_huggingface),
+    ("deepseek",   "DeepSeek V4 Pro (NVIDIA)",  CYAN,    _call_deepseek),
+    ("qwen3",      "Qwen 3.5 397B (NVIDIA)",    MAGENTA, _call_qwen3),
+    ("gemini",     "Gemini 2.5 Pro/Flash",      BLUE,    _call_gemini),
+    ("openrouter", "OpenRouter free pool",      YELLOW,  _call_openrouter),
+    ("groq",       "Groq Llama 3.3 70B",        GREEN,   _call_groq),
 ]
 
 
@@ -1023,7 +1274,8 @@ def _pick_providers(available: dict) -> list:
 
 # ─── Single coin: AI full analysis ──────────────────────────
 
-def analyze_coin_ai(symbol: str, tf_data: dict, user_prefs: dict = None, btc_context: str = None) -> dict:
+def analyze_coin_ai(symbol: str, tf_data: dict, user_prefs: dict = None,
+                    btc_context: str = None, market_context: str = None) -> dict:
     """
     Send multi-timeframe indicator data to AI for full trade analysis.
     AI decides: direction, confidence, entry, SL, TP, timeframe, trade type.
@@ -1034,6 +1286,8 @@ def analyze_coin_ai(symbol: str, tf_data: dict, user_prefs: dict = None, btc_con
                  e.g. {"1m": df_1m, "3m": df_3m, "5m": df_5m, ...}
         btc_context: optional pre-built BTC regime text from build_btc_context(),
                  prepended to the prompt as backdrop for altcoin analysis.
+        market_context: optional live microstructure text from
+                 fetch_data.get_market_context() (funding rate, order book).
         user_prefs: optional dict with the trader's request for this analysis:
                  {"capital": float, "mode": "SCALP"/"INTRADAY"/"SWING"/"ANY",
                   "leverage": int or None, "profit_target": str or None,
@@ -1075,12 +1329,13 @@ INTRADAY/SWING with a deeper target instead, or NO_TRADE if nothing clears frict
 
     confidence_stats_text = format_confidence_stats_text()
     btc_block = f"\n{btc_context}\n" if btc_context else ""
+    market_block = f"\n{market_context}\n" if market_context else ""
 
     prompt = f"""Analyze this coin using multi-timeframe data below. Use top-down analysis:
 1. Start from 1D/1H to determine overall bias
 2. Use 15m/5m to find entry structure
 3. Use 3m/1m for precise entry timing
-{btc_block}
+{btc_block}{market_block}
 {snapshot}
 {request_block}
 {confidence_stats_text}
@@ -1092,8 +1347,6 @@ TIMEFRAME: Pick the best entry timeframe and trade type (SCALP/INTRADAY/SWING).
 If no clear setup exists across ANY timeframe, return direction: "NO_TRADE" with confidence: 0.
 Output ONLY valid JSON as specified in your instructions."""
 
-    _KEY_MAP = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY",
-                "nvidia": "NVIDIA_API_KEY", "huggingface": "HF_API_KEY"}
 
     cached = bool(_availability_cache) and (time.time() - _availability_checked_at < _AVAILABILITY_TTL)
     cache_note = f"{DIM}(cached){RESET}" if cached else f"{DIM}(checking...){RESET}"
@@ -1106,7 +1359,7 @@ Output ONLY valid JSON as specified in your instructions."""
     active = _pick_providers(available)
 
     if not active:
-        tried = ", ".join(k for k in _KEY_MAP if os.getenv(_KEY_MAP[k], ""))
+        tried = ", ".join(k for k, _, _, _ in _PROVIDERS if _has_key(k))
         print(f"  {RED}{BOLD}  No AI providers reachable.{RESET} {DIM}(tried: {tried or 'none configured'}){RESET}")
         return {
             "direction": "NO_TRADE", "confidence": 0,
@@ -1117,8 +1370,7 @@ Output ONLY valid JSON as specified in your instructions."""
 
     # Show each provider: online / offline / no key
     for key, label, color, _ in _PROVIDERS:
-        env_key = _KEY_MAP[key]
-        has_key = bool(os.getenv(env_key, ""))
+        has_key = _has_key(key)
         if available.get(key):
             role = "primary" if key == active[0][0] else "second opinion"
             print(f"  {color}{BOLD}  ✓ {label}{RESET} {DIM}({role}) {cache_note}{RESET}")
@@ -1146,7 +1398,7 @@ Output ONLY valid JSON as specified in your instructions."""
     if all(results.get(key, {}).get("skipped", True) for key, _, _, _ in active):
         attempted = {key for key, _, _, _ in active}
         for key, label, color, fn in _PROVIDERS:
-            if key in attempted or not os.getenv(_KEY_MAP[key], ""):
+            if key in attempted or not _has_key(key):
                 continue
             print(f"  {DIM}All active providers failed — falling back to {label}...{RESET}")
             try:
@@ -1306,7 +1558,7 @@ def _print_analysis(analysis: dict, raw: dict, index: int, total: int, color: st
 
 # ─── Re-analyze an open position ─────────────────────────────
 
-def reanalyze_position_ai(symbol: str, tf_data: dict, position: dict) -> dict:
+def reanalyze_position_ai(symbol: str, tf_data: dict, position: dict, quiet: bool = False) -> dict:
     """
     Re-analyze an OPEN position with fresh multi-timeframe data and the
     trade's current state. AI recommends HOLD / MOVE_SL / MOVE_TP /
@@ -1359,40 +1611,40 @@ MOVE_TP (extend on strong continuation or pull in if momentum is fading), MOVE_B
 CLOSE_NOW (only if the trend has clearly reversed or a major risk event is visible).
 Output ONLY valid JSON as specified in your instructions."""
 
-    _KEY_MAP = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY",
-                "nvidia": "NVIDIA_API_KEY", "huggingface": "HF_API_KEY"}
 
     cached = bool(_availability_cache) and (time.time() - _availability_checked_at < _AVAILABILITY_TTL)
     cache_note = f"{DIM}(cached){RESET}" if cached else f"{DIM}(checking...){RESET}"
 
-    print(f"\n  {CYAN}{BOLD}{'=' * 55}{RESET}")
-    print(f"  {CYAN}{BOLD}  AI POSITION RE-ANALYSIS — {symbol}{RESET}")
-    print(f"  {CYAN}{BOLD}{'=' * 55}{RESET}")
+    if not quiet:
+        print(f"\n  {CYAN}{BOLD}{'=' * 55}{RESET}")
+        print(f"  {CYAN}{BOLD}  AI POSITION RE-ANALYSIS — {symbol}{RESET}")
+        print(f"  {CYAN}{BOLD}{'=' * 55}{RESET}")
 
     available = _check_availability()
     active = _pick_providers(available)
 
     if not active:
-        tried = ", ".join(k for k in _KEY_MAP if os.getenv(_KEY_MAP[k], ""))
-        print(f"  {RED}{BOLD}  No AI providers reachable.{RESET} {DIM}(tried: {tried or 'none configured'}){RESET}")
+        tried = ", ".join(k for k, _, _, _ in _PROVIDERS if _has_key(k))
+        if not quiet:
+            print(f"  {RED}{BOLD}  No AI providers reachable.{RESET} {DIM}(tried: {tried or 'none configured'}){RESET}")
         return {
             "action": "HOLD", "new_stop_loss": None, "new_take_profit": None,
             "urgency": "LOW", "reasons": ["All AI providers unreachable — check API keys and connectivity"],
             "advice": "Try again later", "decided_by": "NONE",
         }
 
-    for key, label, color, _ in _PROVIDERS:
-        env_key = _KEY_MAP[key]
-        has_key = bool(os.getenv(env_key, ""))
-        if available.get(key):
-            role = "primary" if key == active[0][0] else "second opinion"
-            print(f"  {color}{BOLD}  ✓ {label}{RESET} {DIM}({role}) {cache_note}{RESET}")
-        elif has_key:
-            print(f"  {YELLOW}  ✗ {label} — unreachable{RESET}")
-        else:
-            print(f"  {DIM}  — {label} — no API key{RESET}")
+    if not quiet:
+        for key, label, color, _ in _PROVIDERS:
+            has_key = _has_key(key)
+            if available.get(key):
+                role = "primary" if key == active[0][0] else "second opinion"
+                print(f"  {color}{BOLD}  ✓ {label}{RESET} {DIM}({role}) {cache_note}{RESET}")
+            elif has_key:
+                print(f"  {YELLOW}  ✗ {label} — unreachable{RESET}")
+            else:
+                print(f"  {DIM}  — {label} — no API key{RESET}")
 
-    print(f"  {DIM}Sending position + indicator data to AI...{RESET}")
+        print(f"  {DIM}Sending position + indicator data to AI...{RESET}")
 
     # Re-analysis only needs ONE good answer — try providers sequentially,
     # starting with the active (available) ones, then fall back to any
@@ -1400,7 +1652,7 @@ Output ONLY valid JSON as specified in your instructions."""
     order = list(active)
     attempted = {key for key, _, _, _ in order}
     for key, label, color, fn in _PROVIDERS:
-        if key not in attempted and os.getenv(_KEY_MAP[key], ""):
+        if key not in attempted and _has_key(key):
             order.append((key, label, color, fn))
             attempted.add(key)
 
@@ -1416,7 +1668,8 @@ Output ONLY valid JSON as specified in your instructions."""
             raw = {"error": str(e), "skipped": True, "source": key}
 
         if raw.get("skipped", True):
-            print(f"  {YELLOW}  {label}: SKIPPED — {raw.get('error', '?')[:100]}{RESET}")
+            if not quiet:
+                print(f"  {YELLOW}  {label}: SKIPPED — {raw.get('error', '?')[:100]}{RESET}")
             continue
 
         parsed = _parse_reanalysis_response(raw.get("raw_text", ""))
@@ -1427,25 +1680,27 @@ Output ONLY valid JSON as specified in your instructions."""
         a_color = action_colors.get(action, YELLOW)
         u_color = GREEN if urgency == "LOW" else (YELLOW if urgency == "MEDIUM" else RED)
 
-        print(f"\n  {color}{BOLD}{label}{RESET} {DIM}({raw.get('time', '?')}s){RESET}")
-        print(f"  {a_color}{BOLD}  ACTION: {action}{RESET} {DIM}| Urgency: {u_color}{urgency}{RESET}")
+        if not quiet:
+            print(f"\n  {color}{BOLD}{label}{RESET} {DIM}({raw.get('time', '?')}s){RESET}")
+            print(f"  {a_color}{BOLD}  ACTION: {action}{RESET} {DIM}| Urgency: {u_color}{urgency}{RESET}")
 
-        for i, r in enumerate(parsed.get("reasons", [])[:5], 1):
-            print(f"    {DIM}[{i}] {r}{RESET}")
+            for i, r in enumerate(parsed.get("reasons", [])[:5], 1):
+                print(f"    {DIM}[{i}] {r}{RESET}")
 
-        if parsed.get("new_stop_loss"):
-            print(f"    {CYAN}New SL: ${parsed['new_stop_loss']:,.6f}{RESET}")
-        if parsed.get("new_take_profit"):
-            print(f"    {CYAN}New TP: ${parsed['new_take_profit']:,.6f}{RESET}")
-        if parsed.get("advice"):
-            print(f"  {CYAN}  Advice: {parsed['advice'][:150]}{RESET}")
+            if parsed.get("new_stop_loss"):
+                print(f"    {CYAN}New SL: ${parsed['new_stop_loss']:,.6f}{RESET}")
+            if parsed.get("new_take_profit"):
+                print(f"    {CYAN}New TP: ${parsed['new_take_profit']:,.6f}{RESET}")
+            if parsed.get("advice"):
+                print(f"  {CYAN}  Advice: {parsed['advice'][:150]}{RESET}")
 
-        print(f"  {CYAN}{BOLD}{'=' * 55}{RESET}\n")
+            print(f"  {CYAN}{BOLD}{'=' * 55}{RESET}\n")
 
         logger.info(f"[AI Reanalysis] {symbol}: {action} (urgency {urgency}) by {label}")
         return parsed
 
-    print(f"  {RED}{BOLD}  All AI providers failed.{RESET}")
+    if not quiet:
+        print(f"  {RED}{BOLD}  All AI providers failed.{RESET}")
     return {
         "action": "HOLD", "new_stop_loss": None, "new_take_profit": None,
         "urgency": "LOW", "reasons": ["All AI calls failed — cannot re-analyze"],
@@ -1491,8 +1746,6 @@ If NO coins have a good setup, return an empty array [].
 
 Output ONLY a valid JSON array as specified in your instructions."""
 
-    _KEY_MAP = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY",
-                "nvidia": "NVIDIA_API_KEY", "huggingface": "HF_API_KEY"}
     cached = bool(_availability_cache) and (time.time() - _availability_checked_at < _AVAILABILITY_TTL)
     cache_note = f"{DIM}(cached){RESET}" if cached else f"{DIM}(checking...){RESET}"
 
@@ -1508,8 +1761,7 @@ Output ONLY a valid JSON array as specified in your instructions."""
         return []
 
     for key, label, color, _ in _PROVIDERS:
-        env_key = _KEY_MAP[key]
-        has_key = bool(os.getenv(env_key, ""))
+        has_key = _has_key(key)
         if available.get(key):
             role = "primary" if key == active[0][0] else "second opinion"
             print(f"  {color}{BOLD}  ✓ {label}{RESET} {DIM}({role}) {cache_note}{RESET}")
@@ -1535,7 +1787,7 @@ Output ONLY a valid JSON array as specified in your instructions."""
     if all(raw_results.get(key, {}).get("skipped", True) for key, _, _, _ in active):
         attempted = {key for key, _, _, _ in active}
         for key, label, color, fn in _PROVIDERS:
-            if key in attempted or not os.getenv(_KEY_MAP[key], ""):
+            if key in attempted or not _has_key(key):
                 continue
             print(f"  {DIM}All active providers failed — falling back to {label}...{RESET}")
             try:

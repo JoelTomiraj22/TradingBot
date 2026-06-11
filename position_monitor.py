@@ -18,10 +18,59 @@ import threading
 import time
 from datetime import datetime
 from logger_setup import get_logger
+from config import (REANALYSIS_COOLDOWN_MINUTES, MIN_LEVEL_CHANGE_PCT,
+                    AUTO_REANALYZE_MINUTES, DEFAULT_SL_PCT, DEFAULT_TP_PCT)
+from risk_manager import TAKER_FEE_PCT
 
 logger = get_logger("monitor")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
+
+# Below this distance from the reference price, an SL/TP level is inside the
+# fee/friction zone and unusable — same threshold as the AI sanity gate.
+_MIN_LEVEL_DIST_PCT = 0.30
+
+
+def _validate_levels(direction: str, ref_price: float, sl: float, tp: float):
+    """
+    Guarantee a usable, correctly-ordered (SL, TP) pair for `direction` so
+    that every tracked position is ALWAYS protected — regardless of what the
+    AI (or a manual override) provided.
+
+    For LONG, valid levels are SL < ref_price < TP; for SHORT, TP < ref_price
+    < SL. If the given levels are exactly inverted (a known AI-verdict bug),
+    swapping them fixes it. If they're unusable even after swapping (missing,
+    on the wrong side, or too close to ref_price), fall back to default %
+    distances from ref_price so the position is never left unprotected.
+
+    Returns (sl, tp, note) — note is "" if the input levels were fine, or a
+    human-readable description of the correction that was applied.
+    """
+    def _dist_ok(level):
+        if not level or not ref_price:
+            return False
+        return abs(level - ref_price) / ref_price * 100 >= _MIN_LEVEL_DIST_PCT
+
+    if direction == "LONG":
+        if sl and tp and sl < ref_price < tp and _dist_ok(sl) and _dist_ok(tp):
+            return sl, tp, ""
+        if sl and tp and tp < ref_price < sl and _dist_ok(sl) and _dist_ok(tp):
+            return tp, sl, (f"levels were inverted for LONG — swapped SL/TP "
+                            f"(SL ${tp:,.6f} / TP ${sl:,.6f})")
+        new_sl = ref_price * (1 - DEFAULT_SL_PCT / 100)
+        new_tp = ref_price * (1 + DEFAULT_TP_PCT / 100)
+        return new_sl, new_tp, (f"levels unusable for LONG (SL={sl}, TP={tp}, ref=${ref_price:,.6f}) "
+                                 f"— using default {DEFAULT_SL_PCT}%/{DEFAULT_TP_PCT}%")
+    else:  # SHORT
+        if sl and tp and tp < ref_price < sl and _dist_ok(sl) and _dist_ok(tp):
+            return sl, tp, ""
+        if sl and tp and sl < ref_price < tp and _dist_ok(sl) and _dist_ok(tp):
+            return tp, sl, (f"levels were inverted for SHORT — swapped SL/TP "
+                            f"(SL ${tp:,.6f} / TP ${sl:,.6f})")
+        new_sl = ref_price * (1 + DEFAULT_SL_PCT / 100)
+        new_tp = ref_price * (1 - DEFAULT_TP_PCT / 100)
+        return new_sl, new_tp, (f"levels unusable for SHORT (SL={sl}, TP={tp}, ref=${ref_price:,.6f}) "
+                                 f"— using default {DEFAULT_SL_PCT}%/{DEFAULT_TP_PCT}%")
 
 
 class C:
@@ -40,6 +89,7 @@ class PositionMonitor:
         self.executor = executor
         self.tracked = {}        # symbol -> active trade info
         self.pending = {}        # symbol -> pending limit order info
+        self.on_trade_closed = None  # callback(pnl_dollar) — set by bot.py for circuit breaker / daily loss tracking
         self._running = False
         self._thread = None
         self._lock = threading.RLock()
@@ -62,7 +112,17 @@ class PositionMonitor:
             logger.warning(f"[Monitor] Position not confirmed for {symbol}")
             return False
 
-        breakeven = entry_price * 1.0018 if direction == "LONG" else entry_price * 0.9982  # fees + slippage
+        # Mandatory SL/TP: an open position must always have a valid,
+        # correctly-ordered SL/TP — fix or replace them before tracking.
+        stop_loss, take_profit, fix_note = _validate_levels(direction, entry_price, stop_loss, take_profit)
+        if fix_note:
+            print(f"  {C.YELLOW}{C.BOLD}[Monitor] {symbol}: {fix_note}{C.RESET}")
+            logger.warning(f"[Monitor] {symbol}: {fix_note}")
+
+        # Breakeven cushion: taker fees (0.10% round-trip) + slippage between
+        # the 3s price trigger and the actual market fill. 0.18% proved too
+        # thin in practice (a "breakeven" exit landed net negative) — 0.25%.
+        breakeven = entry_price * 1.0025 if direction == "LONG" else entry_price * 0.9975
         total_distance = abs(take_profit - entry_price)
         exit_side = "sell" if direction == "LONG" else "buy"
 
@@ -81,6 +141,7 @@ class PositionMonitor:
                 "opened_at": datetime.now().strftime("%H:%M:%S"),
                 "opened_ts": time.time(),   # For max hold time check
                 "last_reanalysis_ts": time.time(),  # Cooldown anchor for AI re-analysis SL/TP changes
+                "last_auto_reana_ts": time.time(),  # Scheduler anchor for automatic AI re-checks
                 "best_price": entry_price,
                 "sl_stage": "INITIAL",
                 "max_hold_seconds": 4 * 3600,  # 4 hours default
@@ -100,6 +161,9 @@ class PositionMonitor:
         print(f"    {C.DIM}25% to TP → SL moves to breakeven ({be_str}){C.RESET}")
         print(f"    {C.DIM}50% to TP → SL locks 60% of profit{C.RESET}")
         print(f"    {C.DIM}66% to TP → SL trails tight (15% cushion){C.RESET}")
+        if AUTO_REANALYZE_MINUTES > 0:
+            print(f"  {C.CYAN}AI auto re-check every {AUTO_REANALYZE_MINUTES} min{C.RESET}"
+                  f"{C.DIM} — tightens SL when justified, alerts on reversal (never auto-closes){C.RESET}")
         print()
 
         self._save_state()
@@ -136,6 +200,14 @@ class PositionMonitor:
         Track a limit order that hasn't filled yet. When it fills, the monitor
         will automatically place SL/TP and start tracking the position.
         """
+        # Mandatory SL/TP: validate against the limit price (the entry once
+        # filled) so a pending order never carries inverted/unusable levels.
+        if limit_price:
+            stop_loss, take_profit, fix_note = _validate_levels(direction, limit_price, stop_loss, take_profit)
+            if fix_note:
+                print(f"  {C.YELLOW}{C.BOLD}[Monitor] {symbol}: {fix_note}{C.RESET}")
+                logger.warning(f"[Monitor] {symbol} (pending): {fix_note}")
+
         with self._lock:
             self.pending[symbol] = {
                 "order_id": str(order_id),
@@ -301,15 +373,175 @@ class PositionMonitor:
         return result
 
     def _ensure_running(self):
-        """Start the monitor thread if not already running."""
+        """Start the monitor (and auto re-analysis) threads if not running."""
         if not self._running:
             self._running = True
             self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
             self._thread.start()
+            if AUTO_REANALYZE_MINUTES > 0:
+                self._reana_thread = threading.Thread(target=self._reanalysis_loop, daemon=True)
+                self._reana_thread.start()
 
     def stop(self):
         """Stop the monitor."""
         self._running = False
+
+    # ─── Automatic AI re-analysis ──────────────────────────────
+
+    @staticmethod
+    def _sl_auto_apply_check(direction: str, current_sl: float, new_sl: float,
+                             price: float, min_gap_pct: float = 0.3,
+                             min_change_pct: float = MIN_LEVEL_CHANGE_PCT):
+        """
+        Decide whether an AI-suggested SL may be applied AUTOMATICALLY.
+        Policy: tighten-only (lock profit / cut risk), never loosen, never
+        cross current price, never within the stop-hunt buffer of price,
+        ignore sub-noise changes. Returns (ok: bool, reason: str).
+        """
+        if not new_sl or not price or not current_sl:
+            return False, "no level"
+        tighten = new_sl > current_sl if direction == "LONG" else new_sl < current_sl
+        if not tighten:
+            return False, "would loosen SL — never auto-applied"
+        if direction == "LONG" and new_sl >= price:
+            return False, "SL would be above current price"
+        if direction == "SHORT" and new_sl <= price:
+            return False, "SL would be below current price"
+        if abs(new_sl - price) / price * 100 < min_gap_pct:
+            return False, f"within {min_gap_pct}% of price (stop-hunt zone)"
+        if abs(new_sl - current_sl) / price * 100 < min_change_pct:
+            return False, "change too small to matter"
+        return True, "ok"
+
+    def _reanalysis_loop(self):
+        """Background scheduler: AI re-check each open trade every N minutes."""
+        interval = AUTO_REANALYZE_MINUTES * 60
+        while self._running:
+            time.sleep(5)
+            try:
+                now = time.time()
+                with self._lock:
+                    due = [
+                        s for s, t in self.tracked.items()
+                        if now - t.get("last_auto_reana_ts", t.get("opened_ts", now)) >= interval
+                    ]
+                for symbol in due:
+                    self._auto_reanalyze(symbol)
+            except Exception as e:
+                logger.error(f"[Monitor] Auto re-analysis loop error: {e}")
+
+    def _auto_reanalyze(self, symbol: str):
+        """One automatic AI re-check of an open trade (runs off the price loop)."""
+        with self._lock:
+            trade = self.tracked.get(symbol)
+            if not trade:
+                return
+            # Stamp first so a failing provider doesn't retrigger every 5s
+            self.tracked[symbol]["last_auto_reana_ts"] = time.time()
+            trade = dict(trade)
+
+        from fetch_data import fetch_ohlcv
+        from indicators import add_all_indicators
+        from multi_ai_verifier import reanalyze_position_ai, ALL_TIMEFRAMES
+
+        try:
+            price = float(self.exchange.fetch_ticker(symbol)["last"])
+        except Exception as e:
+            logger.error(f"[AutoReana] {symbol} price fetch failed: {e}")
+            return
+
+        tf_data = {}
+        for tf in ALL_TIMEFRAMES:
+            try:
+                limit = 200 if tf in ("1m", "3m", "5m") else 100
+                df = fetch_ohlcv(symbol, tf, limit, self.exchange)
+                tf_data[tf] = add_all_indicators(df)
+            except Exception:
+                pass
+        if not tf_data:
+            logger.error(f"[AutoReana] {symbol} — no timeframe data, skipping")
+            return
+
+        direction = trade["direction"]
+        entry = trade["entry_price"]
+        leverage = trade["leverage"]
+        if direction == "LONG":
+            pnl_pct = ((price - entry) / entry) * leverage * 100
+        else:
+            pnl_pct = ((entry - price) / entry) * leverage * 100
+
+        elapsed = int(time.time() - trade.get("opened_ts", time.time()))
+        hold_time = f"{elapsed // 3600}h {elapsed % 3600 // 60}m" if elapsed >= 3600 else f"{elapsed // 60}m"
+
+        verdict = reanalyze_position_ai(symbol, tf_data, {
+            "direction": direction,
+            "entry_price": entry,
+            "current_price": price,
+            "stop_loss": trade["stop_loss"],
+            "take_profit": trade["take_profit"],
+            "leverage": leverage,
+            "pnl_pct": pnl_pct,
+            "sl_stage": trade.get("sl_stage", "INITIAL"),
+            "hold_time": hold_time,
+        }, quiet=True)
+
+        action = verdict.get("action", "HOLD")
+        reasons = verdict.get("reasons", [])
+        first_reason = reasons[0][:90] if reasons else ""
+        sym_short = symbol.replace("/USDT", "").replace(":USDT", "")
+        pnl_color = C.GREEN if pnl_pct >= 0 else C.RED
+        head = (f"\n  {C.CYAN}{C.BOLD}[AUTO RE-CHECK] {sym_short}{C.RESET} "
+                f"{C.DIM}{direction} | P&L: {C.RESET}{pnl_color}{pnl_pct:+.1f}%{C.RESET}")
+
+        if action == "CLOSE_NOW":
+            print(head)
+            print(f"  {C.RED}{C.BOLD}⚠  AI RECOMMENDS CLOSING — {verdict.get('urgency', '?')} urgency{C.RESET}")
+            for r in reasons[:3]:
+                print(f"  {C.RED}• {r}{C.RESET}")
+            print(f"  {C.YELLOW}Not auto-closing. Review now: type{C.RESET} {C.CYAN}close{C.RESET} "
+                  f"{C.YELLOW}or{C.RESET} {C.CYAN}reanalyse {sym_short.lower()}{C.RESET}")
+            print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
+            logger.warning(f"[AutoReana] {symbol}: AI recommends CLOSE_NOW ({verdict.get('urgency')}) — alert only")
+            return
+
+        new_sl = verdict.get("new_stop_loss")
+        new_tp = verdict.get("new_take_profit")
+
+        if action == "HOLD" or (not new_sl and not new_tp):
+            # Stay quiet-ish: one line so you stay aware without spam
+            print(f"{head} {C.DIM}| AI: HOLD — {first_reason}{C.RESET}")
+            print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
+            return
+
+        printed_head = False
+
+        # SL: tighten-only auto-apply, respecting cooldown + guards
+        if action in ("MOVE_SL", "MOVE_BOTH") and new_sl:
+            ok, why = self._sl_auto_apply_check(direction, trade["stop_loss"], new_sl, price)
+            cooldown = time.time() - trade.get("last_reanalysis_ts", 0) < REANALYSIS_COOLDOWN_MINUTES * 60
+            print(head)
+            printed_head = True
+            if ok and not cooldown:
+                result = self.update_levels(symbol, new_sl=new_sl)
+                if result.get("sl_updated"):
+                    self.mark_reanalyzed(symbol)
+                    print(f"  {C.GREEN}SL auto-tightened: ${trade['stop_loss']:,.6f} → ${new_sl:,.6f}{C.RESET} "
+                          f"{C.DIM}({first_reason}){C.RESET}")
+                    logger.info(f"[AutoReana] {symbol} SL auto-tightened to ${new_sl:,.6f}")
+            else:
+                skip_why = "cooldown active" if cooldown else why
+                print(f"  {C.DIM}AI suggested SL ${new_sl:,.6f} — not applied ({skip_why}){C.RESET}")
+
+        # TP: never auto-changed — suggestion only
+        if action in ("MOVE_TP", "MOVE_BOTH") and new_tp:
+            if not printed_head:
+                print(head)
+                printed_head = True
+            print(f"  {C.YELLOW}AI suggests TP ${trade['take_profit']:,.6f} → ${new_tp:,.6f}{C.RESET} "
+                  f"{C.DIM}— review with: reanalyse {sym_short.lower()}{C.RESET}")
+
+        if printed_head:
+            print(f"{C.CYAN}{C.BOLD}>{C.RESET} ", end="", flush=True)
 
     def _check_pending_orders(self):
         """Poll pending limit orders; auto-activate on fill."""
@@ -520,8 +752,10 @@ class PositionMonitor:
                 new_sl = min(current_sl, breakeven)
             new_stage = "BREAKEVEN"
 
-        # Update if SL changed
-        sl_changed = abs(new_sl - current_sl) > 0.01
+        # Update if SL changed — RELATIVE threshold (0.05% of price), so the
+        # trailing stop also works on sub-dollar coins (DOGE, XRP, ...) where
+        # a fixed $0.01 threshold would never trigger an update.
+        sl_changed = abs(new_sl - current_sl) > current_price * 0.0005
         stage_changed = new_stage != old_stage
 
         if sl_changed or stage_changed:
@@ -582,6 +816,23 @@ class PositionMonitor:
 
                 logger.info(f"[Monitor] {symbol} SL adjusted to {new_stage}: ${new_sl:,.2f} (progress {progress*100:.0f}%)")
 
+    @staticmethod
+    def _net_pnl(direction: str, entry: float, exit_price: float,
+                 quantity: float, leverage: int):
+        """
+        Honest P&L from ACTUAL fill prices, net of taker fees on both sides.
+        Returns (pnl_dollar_net, pnl_pct_net_on_margin, fees).
+        """
+        if direction == "LONG":
+            gross = (exit_price - entry) * quantity
+        else:
+            gross = (entry - exit_price) * quantity
+        fees = (entry + exit_price) * quantity * TAKER_FEE_PCT
+        net = gross - fees
+        capital = abs(entry * quantity) / max(leverage, 1)
+        pct = (net / capital * 100) if capital > 0 else 0.0
+        return net, pct, fees
+
     def _close_position(self, symbol: str, trade: dict, current_price: float,
                         triggered: str, reason: str):
         """Close a position when SL/TP is hit."""
@@ -592,17 +843,22 @@ class PositionMonitor:
         original_sl = trade["original_sl"]
         final_sl = trade["stop_loss"]
 
-        # Calculate P&L
-        if direction == "LONG":
-            pnl_pct = ((current_price - entry) / entry) * leverage * 100
-        else:
-            pnl_pct = ((entry - current_price) / entry) * leverage * 100
-
-        capital = abs(entry * quantity) / leverage
-        pnl_dollar = capital * (pnl_pct / 100)
-
-        # Close via market order
+        # Close via market order FIRST, then compute P&L from the ACTUAL fill
+        # (the old display used the trigger price and ignored fees, so a
+        # "breakeven WIN" could actually be a small net loss on the balance).
         result = self.executor.close_position(symbol)
+
+        exit_price = current_price
+        if isinstance(result, dict) and result.get("close_price"):
+            try:
+                fill = float(result["close_price"])
+                if fill > 0:
+                    exit_price = fill
+            except (TypeError, ValueError):
+                pass
+
+        capital = abs(entry * quantity) / max(leverage, 1)
+        pnl_dollar, pnl_pct, fees = self._net_pnl(direction, entry, exit_price, quantity, leverage)
 
         # Remove from tracking
         self.remove_position(symbol)
@@ -617,12 +873,13 @@ class PositionMonitor:
         print(f"{C.BOLD}{'=' * 55}{C.RESET}")
         print(f"  {C.DIM}{reason}{C.RESET}")
         print(f"  Direction:    {C.GREEN if direction == 'LONG' else C.RED}{direction}{C.RESET}")
-        print(f"  Entry:        ${entry:,.2f}")
-        print(f"  Exit:         ${current_price:,.2f}")
+        print(f"  Entry (fill): ${entry:,.4f}")
+        print(f"  Exit (fill):  ${exit_price:,.4f}  {C.DIM}(trigger was ${current_price:,.4f}){C.RESET}")
         print(f"  Leverage:     {leverage}x")
-        print(f"  Original SL:  ${original_sl:,.2f}")
-        print(f"  Final SL:     ${final_sl:,.2f}  ({trade['sl_stage']})")
-        print(f"  P&L:          {pnl_color}{C.BOLD}${pnl_dollar:+.2f} ({pnl_pct:+.1f}%){C.RESET}")
+        print(f"  Original SL:  ${original_sl:,.4f}")
+        print(f"  Final SL:     ${final_sl:,.4f}  ({trade['sl_stage']})")
+        print(f"  Fees (taker): {C.DIM}-${fees:,.2f}{C.RESET}")
+        print(f"  P&L (net):    {pnl_color}{C.BOLD}${pnl_dollar:+.2f} ({pnl_pct:+.1f}%){C.RESET}")
         print(f"  Result:       {C.GREEN}{C.BOLD}WIN{C.RESET}" if is_win else f"  Result:       {C.RED}{C.BOLD}LOSS{C.RESET}")
 
         # Show if trailing SL saved money on a loss
@@ -647,17 +904,24 @@ class PositionMonitor:
 
         logger.info(f"[Monitor] {triggered} on {symbol} | P&L: ${pnl_dollar:+.2f} ({pnl_pct:+.1f}%) | SL stage: {trade['sl_stage']}")
 
+        # Notify the bot so circuit breaker / daily loss limit actually update
+        if self.on_trade_closed:
+            try:
+                self.on_trade_closed(pnl_dollar)
+            except Exception as e:
+                logger.error(f"[Monitor] on_trade_closed callback error: {e}")
+
         # Log to trade tracker
         try:
             from trade_tracker import log_trade
             log_trade(
                 coin=symbol, direction=direction,
-                entry=entry, exit_price=current_price,
+                entry=entry, exit_price=exit_price,
                 sl=final_sl, tp=trade["take_profit"],
                 leverage=leverage, capital=capital,
                 confidence=trade.get("confidence", 0),
                 pattern=triggered,
-                notes=f"SL stage: {trade['sl_stage']} | Original SL: ${original_sl:,.2f}",
+                notes=f"SL stage: {trade['sl_stage']} | Original SL: ${original_sl:,.4f} | Fees: ${fees:,.2f}",
             )
         except Exception as e:
             logger.error(f"[Monitor] Failed to log trade: {e}")

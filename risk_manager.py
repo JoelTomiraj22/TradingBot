@@ -8,11 +8,11 @@ from config import RISK_PER_TRADE, MIN_RR_RATIO, CAPITAL_PER_TRADE
 
 # ─── Constants ─────────────────────────────────────────────────
 TRADING_FEE_PCT = 0.0004        # 0.04% per side (maker), 0.04% round trip = 0.08%
+TAKER_FEE_PCT = 0.0005          # 0.05% per side — market orders (entry + SL/TP closes)
 ROUND_TRIP_FEE_PCT = 0.0008     # Total fees for entry + exit
 SLIPPAGE_PCT = 0.0010           # 0.10% estimated slippage (entry + exit combined)
 TOTAL_COST_PCT = ROUND_TRIP_FEE_PCT + SLIPPAGE_PCT  # ~0.18% total friction
 MAX_LEVERAGE = 25               # Hard cap
-MAX_CONCURRENT_RISK_PCT = 0.06  # Max 6% of account at risk across all positions
 MAX_HOLD_HOURS = 4              # Max hold time for scalp trades (hours)
 MAX_DAILY_LOSS_PCT = 0.05       # 5% max daily drawdown — stop trading for the day
 
@@ -166,12 +166,12 @@ def calculate_expected_pnl(entry_price: float, stop_loss: float,
 def validate_trade(account_balance: float, entry_price: float,
                    stop_loss: float, take_profit: float,
                    confidence: int, direction: str,
-                   trade_type: str = "SCALP",
-                   allow_low_rr: bool = False) -> dict:
+                   trade_type: str = "SCALP") -> dict:
     """Full trade validation with leverage-aware risk and fee calculation.
 
-    allow_low_rr: skip the minimum R:R check (manual user override after
-    being shown the rejection — other checks still apply).
+    Rejections are FINAL — there is deliberately no override path. A trade
+    that fails the R:R / friction math has negative expectancy even when
+    it 'wins' (see trade history: every overridden trade lost money net).
     """
     min_rr = MIN_RR_BY_TYPE.get(trade_type, MIN_RR_RATIO)
     # Check confidence
@@ -179,7 +179,7 @@ def validate_trade(account_balance: float, entry_price: float,
     if leverage == 0:
         return {
             "approved": False,
-            "reason": f"DON'T TRADE — Confidence {confidence}/10 is below threshold (min 6)",
+            "reason": f"DON'T TRADE — Confidence {confidence}/10 is below threshold (need 7+)",
         }
 
     # Check basic R:R (raw, pre-fees)
@@ -189,7 +189,7 @@ def validate_trade(account_balance: float, entry_price: float,
         return {"approved": False, "reason": "Stop distance is zero"}
 
     rr_raw = tp_dist / stop_dist
-    if rr_raw < 1.5 and not allow_low_rr:
+    if rr_raw < 1.5:
         return {"approved": False, "reason": f"Raw R:R {rr_raw:.2f} is too low (need 1.5+ raw)"}
 
     # Check stop is not too tight — friction (0.18%) must be < 60% of SL distance
@@ -208,7 +208,7 @@ def validate_trade(account_balance: float, entry_price: float,
                                  pos["quantity"], direction, pos["position_size"])
 
     # Reject if after-fees R:R is below minimum (lower bar for SCALP — tighter targets)
-    if pnl["rr_ratio"] < min_rr and not allow_low_rr:
+    if pnl["rr_ratio"] < min_rr:
         return {
             "approved": False,
             "reason": f"R:R after fees+slippage is {pnl['rr_ratio']:.2f}:1 — need {min_rr}:1+ for {trade_type}. "
@@ -216,7 +216,7 @@ def validate_trade(account_balance: float, entry_price: float,
         }
 
     # Reject if fees eat too much of the profit
-    if pnl["fees"] > pnl["expected_profit"] * 0.3 and not allow_low_rr:
+    if pnl["fees"] > pnl["expected_profit"] * 0.3:
         return {"approved": False, "reason": f"Fees+slippage (${pnl['fees']:.2f}) eat >30% of profit — target too small"}
 
     breakeven = calculate_breakeven(entry_price, direction)

@@ -5,9 +5,14 @@ Scans top Binance Futures gainers, filters, and ranks by strategy confidence.
 
 from tabulate import tabulate
 from fetch_data import fetch_ohlcv, get_top_gainers
-from indicators import add_all_indicators
+from indicators import (add_all_indicators, add_higher_tf_indicators,
+                        estimate_eta_minutes, check_sl_hunt_risk)
 from strategy import evaluate_signal
 from config import get_exchange, DEFAULT_TIMEFRAME
+
+# Entry TF -> confirmation TF for multi-timeframe alignment
+HTF_MAP = {"1m": "5m", "5m": "15m", "15m": "1h", "1h": "4h"}
+TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
 
 
 def scan_top_gainers(timeframe: str = None, limit: int = 10, exchange=None) -> list:
@@ -42,12 +47,33 @@ def scan_top_gainers(timeframe: str = None, limit: int = 10, exchange=None) -> l
         return []
 
     results = []
+    htf = HTF_MAP.get(timeframe, "1h")
     for _, row in gainers.iterrows():
         symbol = row["symbol"]
         try:
             df = fetch_ohlcv(symbol, timeframe, 200, exchange)
             df = add_all_indicators(df)
-            signal = evaluate_signal(df)
+
+            # Higher-timeframe confirmation (same boost/penalty as manual analysis)
+            try:
+                df_htf = fetch_ohlcv(symbol, htf, 100, exchange)
+                htf_data = add_higher_tf_indicators(df_htf)
+            except Exception:
+                htf_data = {"htf_trend": "NEUTRAL", "htf_valid": False}
+
+            signal = evaluate_signal(df, htf_data)
+
+            # Time-to-TP estimate + stop-hunt check for actionable signals
+            eta_range = None
+            sl_hunt = None
+            if signal["direction"] in ("LONG", "SHORT") and signal["entry"] and signal["take_profit"]:
+                eta_range = estimate_eta_minutes(
+                    df, signal["entry"], signal["take_profit"],
+                    TF_MINUTES.get(timeframe, 5),
+                )
+                sl_hunt = check_sl_hunt_risk(
+                    df, signal["direction"], signal["stop_loss"], signal["entry"],
+                )
 
             results.append({
                 "coin": symbol,
@@ -61,6 +87,8 @@ def scan_top_gainers(timeframe: str = None, limit: int = 10, exchange=None) -> l
                 "take_profit": signal["take_profit"],
                 "leverage": signal["leverage"],
                 "rr_ratio": None,
+                "eta_range": eta_range,
+                "sl_hunt": sl_hunt,
                 "reasons": signal["reasons"],
             })
 
@@ -98,6 +126,7 @@ def print_scan_results(results: list):
             "SL": f"${r['stop_loss']:,.2f}" if r["stop_loss"] else "-",
             "TP": f"${r['take_profit']:,.2f}" if r["take_profit"] else "-",
             "R:R": f"{r['rr_ratio']}:1" if r["rr_ratio"] else "-",
+            "ETA": f"{r['eta_range'][0]}-{r['eta_range'][1]}m" if r.get("eta_range") else "-",
             "Lev": f"{r['leverage']}x" if r["leverage"] else "-",
         })
 

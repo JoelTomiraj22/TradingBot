@@ -17,8 +17,10 @@ Setup Instructions:
 4. The server will validate the alert against the strategy before passing to the bot.
 """
 
-from flask import Flask, request, jsonify
+from collections import deque
 from datetime import datetime
+
+from flask import Flask, request, jsonify
 
 from fetch_data import fetch_ohlcv
 from indicators import add_all_indicators
@@ -28,8 +30,10 @@ from logger_setup import get_logger
 app = Flask(__name__)
 logger = get_logger("webhook")
 
-# Store pending alerts for the bot to pick up
-pending_alerts = []
+MIN_CONFIDENCE = 7  # same entry gate as the live bot
+
+# Store pending alerts for the bot to pick up (bounded — drops oldest)
+pending_alerts = deque(maxlen=100)
 
 
 @app.route("/health", methods=["GET"])
@@ -88,7 +92,7 @@ def webhook():
         }
 
         # Confirm if strategy agrees with TradingView alert
-        if signal["direction"] == tv_direction and signal["confidence"] >= 5:
+        if signal["direction"] == tv_direction and signal["confidence"] >= MIN_CONFIDENCE:
             alert_result["confirmed"] = True
             alert_result["entry"] = signal["entry"]
             alert_result["stop_loss"] = signal["stop_loss"]
@@ -110,7 +114,7 @@ def webhook():
 @app.route("/alerts", methods=["GET"])
 def get_alerts():
     """Get pending confirmed alerts."""
-    return jsonify({"alerts": pending_alerts, "count": len(pending_alerts)})
+    return jsonify({"alerts": list(pending_alerts), "count": len(pending_alerts)})
 
 
 @app.route("/alerts/clear", methods=["POST"])
